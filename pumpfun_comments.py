@@ -22,11 +22,12 @@ def get_token_info(mint_address):
             - reply_count: Number of replies
             - is_currently_live: Whether the token is currently live
             - ath_market_cap: All-time high market cap
+            - ath_market_cap_timestamp: Timestamp when the token reached all-time high market cap
             - created_timestamp: Timestamp when the token was created
     """
     required_fields = ['mint', 'name', 'symbol', 'description', 'image_uri', 
                      'creator', 'inverted', 'reply_count', 'is_currently_live', 
-                     'ath_market_cap', 'created_timestamp']
+                     'ath_market_cap', 'created_timestamp', 'ath_market_cap_timestamp']
     url = f"https://pump.fun/coin/{mint_address}?include-nsfw=true"
     
     try:
@@ -49,6 +50,21 @@ def get_token_info(mint_address):
             if match:
                 try:
                     result['created_timestamp'] = int(match.group(1))
+                    break
+                except (ValueError, IndexError):
+                    pass
+
+        ath_timestamp_patterns = [
+            r'ath_market_cap_timestamp\\?":\\?\"?(\d{10,13})\\?\"?',
+            r'ath_market_cap_timestamp\\?"?:(\d{10,13})',
+            r'ath_market_cap[_\-]timestamp\\?"?:\s*"?(\d{10,13})"?'
+        ]
+
+        for pattern in ath_timestamp_patterns:
+            match = re.search(pattern, html_str)
+            if match:
+                try:
+                    result['ath_market_cap_timestamp'] = int(match.group(1))
                     break
                 except (ValueError, IndexError):
                     pass
