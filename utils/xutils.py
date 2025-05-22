@@ -50,8 +50,7 @@ def get_previous_name(username):
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error: {response.status_code}")
-        print(response.text)
+        print(f"Error: {response.status_code} {response.text} get_previous_name")
         return None
 
 def get_mentions_ca(username):
@@ -79,7 +78,7 @@ def get_mentions_ca(username):
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error: {response.status_code}")
+        print(f"Error: {response.status_code} get_mentions_ca")
         print(response.text)
         return None
 
@@ -108,8 +107,7 @@ def get_twitter_labels(username):
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error: {response.status_code}")
-        print(response.text)
+        print(f"Error: {response.status_code} {response.text} get_twitter_labels")
         return None
 
 def get_twitter_user_followers(username):
@@ -132,8 +130,8 @@ def get_twitter_user_followers(username):
     
     # Check if the request was successful
     if response.status_code == 200:
+        print("get_twitter_user_followers success")
         return response.json()
     else:
-        print(f"Error: {response.status_code}")
-        print(response.text)
+        print(f"Error: {response.status_code} {response.text} get_twitter_user_followers")
         return None

@@ -57,12 +57,21 @@ ATH_MARKET_CAP_THRESHOLD = float(os.getenv("ATH_MARKET_CAP_THRESHOLD", "40"))  #
 ACTIVITY_CHECK_INTERVAL = int(os.getenv("ACTIVITY_CHECK_INTERVAL", "180"))  # 默认3分钟检查一次活跃状态
 INACTIVE_THRESHOLD = int(os.getenv("INACTIVE_THRESHOLD", "3"))  # 连续几次判断不活跃后剔除，默认3次
 MAX_PROJECT_AGE = int(os.getenv("MAX_PROJECT_AGE", "600"))  # 项目最大年龄，超过则不再判断，默认10分钟(600秒)
+TWEET_REPEAT_INTERVAL = int(os.getenv("TWEET_REPEAT_INTERVAL", "300"))  # 5分钟
 
 # Initialize Redis client
 redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
     db=REDIS_DB,
+    password=REDIS_PASSWORD,
+    decode_responses=True
+)
+
+twitter_redis = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=3,
     password=REDIS_PASSWORD,
     decode_responses=True
 )
@@ -106,7 +115,7 @@ stop_event = multiprocessing.Event()
 manually_removed_projects: Set[str] = set()  # 存储被手动删除的mint_address
 
 # 全局变量: 控制是否获取X用户信息以及获取范围
-FETCH_X_INFO = "launchacoin"  # 可选值: "none", "launchacoin", "all"
+FETCH_X_INFO = "all"  # 可选值: "none", "launchacoin", "all"
 
 # 验证合约地址是否可能有效
 def is_valid_contract_address(contract_address: str) -> bool:
@@ -913,6 +922,7 @@ async def add_meme_project(project: Dict[str, Any]):
     try:
         # Normalize project fields to match frontend expectations
         normalized_project = normalize_project(project)
+        name = normalized_project["name"]
         
         # 检查是否需要获取Twitter信息
         should_fetch_x_info = False
@@ -946,6 +956,34 @@ async def add_meme_project(project: Dict[str, Any]):
                 if twitter_info:
                     normalized_project["twitter_info"] = twitter_info
         
+        # ========== 新增：推文去重与时间阈值判断 ==========
+        tweet_info = None
+        # 检查 links
+        if "links" in normalized_project and isinstance(normalized_project["links"], dict):
+            for v in normalized_project["links"].values():
+                if isinstance(v, str):
+                    tweet_info = extract_tweet_info(v)
+                    if tweet_info:
+                        break
+        # 检查 hoverTweet
+        if not tweet_info and "hoverTweet" in normalized_project and isinstance(normalized_project["hoverTweet"], str):
+            tweet_info = extract_tweet_info(normalized_project["hoverTweet"])
+        if tweet_info:
+            user, tweet_id = tweet_info
+            tweet_key = f"tweet:{user}:{tweet_id}"
+            now = int(time.time())
+            last_time = redis_client.get(tweet_key)
+            if last_time:
+                last_time = int(last_time)
+                if now - last_time > TWEET_REPEAT_INTERVAL:
+                    name = normalized_project["name"]
+                    logger.info(f"推文 {tweet_key} 距离上次出现已超过阈值({TWEET_REPEAT_INTERVAL}s)，本次不推送 {name}")
+                    redis_client.set(tweet_key, now)
+                    return {"status": "ignored", "message": f"Tweet {tweet_key} ignored due to repeat interval"}
+            else:
+                redis_client.set(tweet_key, now)
+        # ========== 新增结束 ==========
+        
         # Generate a unique key for the project
         project_id = f"meme_project:{normalized_project.get('id', str(hash(json.dumps(normalized_project))))}"
         
@@ -958,8 +996,10 @@ async def add_meme_project(project: Dict[str, Any]):
             {project_id: float(normalized_project['timestamp'])}
         )
 
-        # if normalized_project["from"] == "launchacoin":
-        #    print(normalized_project["name"], normalized_project)
+        if normalized_project["from"] == "launchacoin":
+            twitter_redis.sadd(f"twitter:{twitter_handle}:mentioned_contracts_set", *set([normalized_project["contractAddress"]]))
+
+        # normalized_project["twitter_info"][""] = redis_client.smembers(f"launchacoin_deployers:{twitter_handle}")
         
         # Broadcast to all connected WebSocket clients
         await broadcast_to_clients({"type": "new_project", "data": normalized_project})
@@ -1003,16 +1043,7 @@ async def get_meme_projects(
                 
                 if pump_desc:
                     project['pump_desc'] = pump_desc
-                    # 打印包含pump_desc的完整项目信息
-                    print("\n=== 添加pump_desc后的项目数据 ===")
-                    print(f"名称: '{project.get('name', '没有提供名称')}'")
-                    print(f"符号: '{project.get('symbol', '没有提供符号')}'")
-                    print(f"合约地址: '{contract_address}'")
-                    print(f"pump_desc: '{pump_desc}'")
-                    print("完整项目数据:")
-                    pprint(project)
-                    print("=================================\n")
-        
+
         return {
             "status": "success", 
             "projects": projects,
@@ -1122,14 +1153,6 @@ def get_twitter_complete_info(username: str) -> Dict[str, Any]:
     # logger.info(f"正在获取Twitter用户信息: {username}")
     
     try:
-        # 创建Redis连接到DB 3
-        twitter_redis = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=3,  # 使用DB 3存储Twitter信息
-            password=REDIS_PASSWORD,
-            decode_responses=True
-        )
         
         # 获取当前时间戳
         current_time = time.time()
@@ -1169,20 +1192,17 @@ def get_twitter_complete_info(username: str) -> Dict[str, Any]:
                 return None
         
         def fetch_mentions_ca():
+            mentions_ca_info = None
             try:
                 mentions_ca_info = get_mentions_ca(username)
-                # 存储到Redis
-                if mentions_ca_info:
-                    twitter_redis.hset(
-                        f"twitter:{username}:mentioned_contracts",
-                        mapping={
-                            "data": json.dumps(mentions_ca_info),
-                            "timestamp": current_time
-                        }
-                    )
-                return mentions_ca_info
+                if mentions_ca_info["success"]:
+                    if "data" in mentions_ca_info:
+                        mentioned_contracts_set = set(mentions_ca_info["data"])
+                        if mentioned_contracts_set:
+                            twitter_redis.sadd(f"twitter:{username}:mentioned_contracts_set", *mentioned_contracts_set)
+                return mentions_ca_info 
             except Exception as e:
-                logger.error(f"获取提及CA信息出错: {str(e)}")
+                logger.error(f"获取提及CA信息出错: {str(e)}, {username}, {mentions_ca_info}")
                 return None
         
         def fetch_followers_info():
@@ -1216,7 +1236,7 @@ def get_twitter_complete_info(username: str) -> Dict[str, Any]:
         
         # 处理曾用名信息
         if prev_name_info and prev_name_info.get("success"):
-            result["previous_names"] = prev_name_info.get("data")
+            result["previous_names"] = prev_name_info.get("data", [])
         
         # 处理提及的CA信息
         if mentions_ca_info and mentions_ca_info.get("success"):
@@ -1250,6 +1270,16 @@ def get_twitter_complete_info(username: str) -> Dict[str, Any]:
         logger.error(f"获取Twitter用户信息时出错: {str(e)}")
         return {"error": str(e)}
 
+def extract_tweet_info(text: str) -> Optional[Tuple[str, str]]:
+    """
+    从文本中提取 x.com/twitter.com 推文的 user 和 tweet_id
+    """
+    pattern = r"(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/([a-zA-Z0-9_]+)/status/(\d+)"
+    match = re.search(pattern, text)
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -1260,7 +1290,7 @@ if __name__ == "__main__":
     # Configure uvicorn
     config = uvicorn.Config(
         "main:app", 
-        host="0.0.0.0", 
+        host="192.168.1.2", 
         port=5001, 
         reload=False,
         log_level="info",
