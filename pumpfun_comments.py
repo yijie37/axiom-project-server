@@ -356,7 +356,8 @@ def get_token_info(mint_address):
 
 if __name__ == "__main__":
     mint_address = "8xhH7tDB6m1akaexEYsn8Qkb58r6EY8MA4t958mipump"
-    mints=['5QBjgGF4n6BAGn1ErQjEKLfuHmMLb313K8xYRorepump', '8xhH7tDB6m1akaexEYsn8Qkb58r6EY8MA4t958mipump', 'Ai3eKAWjzKMV8wRwd41nVP83yqfbAVJykhvJVPxspump', '8BdXCskcD98NUk9Ciwx6eZqXUD9zB891sSu3rYBSpump', 'CL2bvqdTtYQqhwQC1Ad5GZ7cedW9RrbtUK4AZs9Bpump', 'CxZuAv8LH4LWJ9CFBjGi6V6Vb9jA3EHUDtJDyCQ2pump']
+    # mints=['5QBjgGF4n6BAGn1ErQjEKLfuHmMLb313K8xYRorepump', '8xhH7tDB6m1akaexEYsn8Qkb58r6EY8MA4t958mipump', 'Ai3eKAWjzKMV8wRwd41nVP83yqfbAVJykhvJVPxspump', '8BdXCskcD98NUk9Ciwx6eZqXUD9zB891sSu3rYBSpump', 'CL2bvqdTtYQqhwQC1Ad5GZ7cedW9RrbtUK4AZs9Bpump', 'CxZuAv8LH4LWJ9CFBjGi6V6Vb9jA3EHUDtJDyCQ2pump']
+    mints=['9YepoRWrJYyxDkoCjXr6dgAEdHjkoSyCzkqvqD1Upump']
     for mint in mints:
         token_info = get_token_info(mint)
         print("完整信息:", token_info)

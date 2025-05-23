@@ -130,7 +130,7 @@ def get_twitter_user_followers(username):
     
     # Check if the request was successful
     if response.status_code == 200:
-        print("get_twitter_user_followers success")
+        # print("get_twitter_user_followers success")
         return response.json()
     else:
         print(f"Error: {response.status_code} {response.text} get_twitter_user_followers")

@@ -51,6 +51,11 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "6"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
+# Redis keys for project views
+PROJECT_VIEWS_SET = "project_views:set"  # 存储所有project_view的ID
+PROJECT_VIEW_HASH = "project_view:"  # 存储具体的project_view数据
+PROJECT_VIEWS_BY_TIME = "project_views:by_time"  # 按时间排序的project_view集合
+
 # 可配置的活跃判断参数
 PROJECT_WAIT_TIME = int(os.getenv("PROJECT_WAIT_TIME", "180"))  # 默认3分钟 (180秒)
 ATH_MARKET_CAP_THRESHOLD = float(os.getenv("ATH_MARKET_CAP_THRESHOLD", "40"))  # 默认40
@@ -58,6 +63,14 @@ ACTIVITY_CHECK_INTERVAL = int(os.getenv("ACTIVITY_CHECK_INTERVAL", "180"))  # �
 INACTIVE_THRESHOLD = int(os.getenv("INACTIVE_THRESHOLD", "3"))  # 连续几次判断不活跃后剔除，默认3次
 MAX_PROJECT_AGE = int(os.getenv("MAX_PROJECT_AGE", "600"))  # 项目最大年龄，超过则不再判断，默认10分钟(600秒)
 TWEET_REPEAT_INTERVAL = int(os.getenv("TWEET_REPEAT_INTERVAL", "300"))  # 5分钟
+
+# 统计数据的Redis key
+STATS_TOTAL_PROJECTS = "stats:total_projects"
+STATS_YOUTUBE_PROJECTS = "stats:youtube_projects"
+STATS_TIKTOK_PROJECTS = "stats:tiktok_projects"
+STATS_INSTAGRAM_PROJECTS = "stats:instagram_projects"
+STATS_NO_SOCIAL_PROJECTS = "stats:no_social_projects"
+STATS_NOT_BROADCAST_PROJECTS = "stats:not_broadcast_projects"  # 新增：不广播的项目数
 
 # Initialize Redis client
 redis_client = redis.Redis(
@@ -924,6 +937,9 @@ async def add_meme_project(project: Dict[str, Any]):
         normalized_project = normalize_project(project)
         name = normalized_project["name"]
         
+        # 更新统计数据
+        update_project_stats(normalized_project)
+        
         # 检查是否需要获取Twitter信息
         should_fetch_x_info = False
         twitter_handle = None
@@ -949,7 +965,6 @@ async def add_meme_project(project: Dict[str, Any]):
             
             # 如果找到Twitter用户名，获取信息
             if twitter_handle:
-                # logger.info(f"找到Twitter用户名: {twitter_handle}, 正在获取信息")
                 twitter_info = get_twitter_complete_info(twitter_handle)
                 
                 # 将Twitter信息添加到项目中
@@ -976,9 +991,9 @@ async def add_meme_project(project: Dict[str, Any]):
             if last_time:
                 last_time = int(last_time)
                 if now - last_time > TWEET_REPEAT_INTERVAL:
-                    name = normalized_project["name"]
                     logger.info(f"推文 {tweet_key} 距离上次出现已超过阈值({TWEET_REPEAT_INTERVAL}s)，本次不推送 {name}")
                     redis_client.set(tweet_key, now)
+                    redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)  # 增加不广播计数
                     return {"status": "ignored", "message": f"Tweet {tweet_key} ignored due to repeat interval"}
             else:
                 redis_client.set(tweet_key, now)
@@ -999,7 +1014,23 @@ async def add_meme_project(project: Dict[str, Any]):
         if normalized_project["from"] == "launchacoin":
             twitter_redis.sadd(f"twitter:{twitter_handle}:mentioned_contracts_set", *set([normalized_project["contractAddress"]]))
 
-        # normalized_project["twitter_info"][""] = redis_client.smembers(f"launchacoin_deployers:{twitter_handle}")
+        # 检查是否无社交媒体
+        has_hover_tweet = bool(normalized_project.get("hoverTweet"))
+        has_links = bool(normalized_project.get("links"))
+        has_pump_only = False
+        
+        if has_links:
+            links = normalized_project["links"]
+            if isinstance(links, dict):
+                # 检查是否只有pump.fun链接
+                has_pump_only = all(
+                    "pump.fun" in v for v in links.values() if isinstance(v, str)
+                ) and len(links) > 0
+        
+        # 如果无社交媒体，不广播并增加不广播计数
+        if not has_hover_tweet and (not has_links or has_pump_only) and not normalized_project["website"]:
+            redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
+            return {"status": "ignored", "message": "Project ignored due to no social media"}
         
         # Broadcast to all connected WebSocket clients
         await broadcast_to_clients({"type": "new_project", "data": normalized_project})
@@ -1164,7 +1195,7 @@ def get_twitter_complete_info(username: str) -> Dict[str, Any]:
         if cached_info and "data" in cached_info and "timestamp" in cached_info:
             cached_timestamp = float(cached_info["timestamp"])
             if current_time - cached_timestamp < 86400:  # 数据不超过1天
-                logger.info(f"使用Redis缓存中的Twitter用户信息: {username} (缓存时间: {int(current_time - cached_timestamp)}秒)")
+                # logger.info(f"使用Redis缓存中的Twitter用户信息: {username} (缓存时间: {int(current_time - cached_timestamp)}秒)")
                 try:
                     return json.loads(cached_info["data"])
                 except Exception as e:
@@ -1279,6 +1310,167 @@ def extract_tweet_info(text: str) -> Optional[Tuple[str, str]]:
     if match:
         return match.group(1), match.group(2)
     return None
+
+def update_project_stats(normalized_project: Dict[str, Any]):
+    """更新项目统计数据"""
+    try:
+        # 增加总项目数
+        total = redis_client.incr(STATS_TOTAL_PROJECTS)
+        
+        # 检查website链接
+        website = None
+        if "links" in normalized_project and isinstance(normalized_project["links"], dict):
+            website = normalized_project["links"].get("website", "")
+        
+        # 统计各平台项目数
+        youtube_count = 0
+        tiktok_count = 0
+        instagram_count = 0
+        no_social_count = 0
+        not_broadcast_count = 0
+        
+        if website:
+            if "www.youtube.com" in website:
+                youtube_count = redis_client.incr(STATS_YOUTUBE_PROJECTS)
+            if "www.tiktok.com" in website:
+                tiktok_count = redis_client.incr(STATS_TIKTOK_PROJECTS)
+            if "www.instagram.com" in website:
+                instagram_count = redis_client.incr(STATS_INSTAGRAM_PROJECTS)
+        
+        # 统计无社交媒体的项目数
+        has_hover_tweet = bool(normalized_project.get("hoverTweet"))
+        has_links = bool(normalized_project.get("links"))
+        has_pump_only = False
+        
+        if has_links:
+            links = normalized_project["links"]
+            if isinstance(links, dict):
+                # 检查是否只有pump.fun链接
+                has_pump_only = all(
+                    "pump.fun" in v for v in links.values() if isinstance(v, str)
+                ) and len(links) > 0
+        
+        if not has_hover_tweet and (not has_links or has_pump_only) and not website:
+            no_social_count = redis_client.incr(STATS_NO_SOCIAL_PROJECTS)
+        
+        # 每20个项目打印一次统计值
+        if total % 20 == 0:
+            youtube_count = int(redis_client.get(STATS_YOUTUBE_PROJECTS) or 0)
+            tiktok_count = int(redis_client.get(STATS_TIKTOK_PROJECTS) or 0)
+            instagram_count = int(redis_client.get(STATS_INSTAGRAM_PROJECTS) or 0)
+            no_social_count = int(redis_client.get(STATS_NO_SOCIAL_PROJECTS) or 0)
+            not_broadcast_count = int(redis_client.get(STATS_NOT_BROADCAST_PROJECTS) or 0)
+            logger.info(f"统计值 [总数: {total}] [YouTube: {youtube_count}] [TikTok: {tiktok_count}] [Instagram: {instagram_count}] [无社交: {no_social_count}] [不广播: {not_broadcast_count}]")
+            
+    except Exception as e:
+        logger.error(f"更新统计数据时出错: {str(e)}")
+
+@app.get("/api/stats")
+async def get_project_stats():
+    """获取项目统计数据"""
+    try:
+        stats = {
+            "total_projects": int(redis_client.get(STATS_TOTAL_PROJECTS) or 0),
+            "youtube_projects": int(redis_client.get(STATS_YOUTUBE_PROJECTS) or 0),
+            "tiktok_projects": int(redis_client.get(STATS_TIKTOK_PROJECTS) or 0),
+            "instagram_projects": int(redis_client.get(STATS_INSTAGRAM_PROJECTS) or 0),
+            "no_social_projects": int(redis_client.get(STATS_NO_SOCIAL_PROJECTS) or 0),
+            "not_broadcast_projects": int(redis_client.get(STATS_NOT_BROADCAST_PROJECTS) or 0)
+        }
+        return {"status": "success", "stats": stats}
+    except Exception as e:
+        logger.error(f"获取统计数据时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+@app.post("/api/project-views")
+async def add_project_view(project_view: Dict[str, Any]):
+    """记录项目浏览信息"""
+    try:
+        # 验证必需字段
+        logger.info(f"project_view: {project_view}")
+        required_fields = ["name", "description", "contract_address", "timestamp", "market_cap"]
+        for field in required_fields:
+            if field not in project_view:
+                logger.info(f"missing {field}")
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        # 生成唯一ID
+        view_id = f"{project_view['contract_address']}:{project_view['timestamp']}"
+        logger.info(f"view_id: {view_id}")
+        
+        # 存储到Redis
+        # 1. 存储到集合中
+        redis_client.sadd(PROJECT_VIEWS_SET, view_id)
+        
+        # 2. 存储详细信息
+        try:
+            redis_key = f"{PROJECT_VIEW_HASH}{view_id}"
+            
+            mapping_data = {
+                "name": project_view["name"],
+                "description": project_view["description"],
+                "contract_address": project_view["contract_address"],
+                "timestamp": project_view["timestamp"],
+                "market_cap": project_view["market_cap"]
+            }
+            
+            redis_client.hset(
+                redis_key,
+                mapping=mapping_data
+            )
+        except Exception as e:
+            logger.error(f"Error storing data in Redis: {str(e)}")
+            raise
+        
+        # 3. 添加到时间排序集合
+        redis_client.zadd(
+            PROJECT_VIEWS_BY_TIME,
+            {view_id: float(project_view["timestamp"])}
+        )
+        
+        return {"status": "success", "message": "Project view recorded successfully"}
+    except Exception as e:
+        logger.error(f"记录项目浏览信息时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to record project view: {str(e)}")
+
+@app.get("/api/project-views")
+async def get_project_views(
+    start_time: int = Query(..., description="Start timestamp (in seconds)"),
+    end_time: int = Query(..., description="End timestamp (in seconds)")
+):
+    """获取指定时间范围内的项目浏览列表"""
+    try:
+        # 从时间排序集合中获取指定范围内的项目ID
+        view_ids = redis_client.zrangebyscore(
+            PROJECT_VIEWS_BY_TIME,
+            start_time,
+            end_time
+        )
+        
+        # 获取每个项目的详细信息
+        project_views = []
+        for view_id in view_ids:
+            view_data = redis_client.hgetall(f"{PROJECT_VIEW_HASH}{view_id}")
+            if view_data:
+                project_views.append({
+                    "name": view_data["name"],
+                    "description": view_data["description"],
+                    "contract_address": view_data["contract_address"],
+                    "timestamp": int(view_data["timestamp"]),
+                    "market_cap": float(view_data["market_cap"])
+                })
+        
+        # 按时间戳排序
+        project_views.sort(key=lambda x: x["timestamp"])
+        
+        return {
+            "status": "success",
+            "project_views": project_views,
+            "total": len(project_views)
+        }
+    except Exception as e:
+        logger.error(f"获取项目浏览列表时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get project views: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
