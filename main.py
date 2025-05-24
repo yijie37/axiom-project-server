@@ -34,7 +34,11 @@ warnings.filterwarnings('ignore', category=InsecureRequestWarning)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),  # Output to console
+        logging.FileHandler('main.log')  # Also save to file
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -95,7 +99,7 @@ app = FastAPI(title="Axiom Project Server")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],  # 允许所有源访问
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1353,8 +1357,8 @@ def update_project_stats(normalized_project: Dict[str, Any]):
         if not has_hover_tweet and (not has_links or has_pump_only) and not website:
             no_social_count = redis_client.incr(STATS_NO_SOCIAL_PROJECTS)
         
-        # 每20个项目打印一次统计值
-        if total % 20 == 0:
+        # 每100个项目打印一次统计值
+        if total % 100 == 0:
             youtube_count = int(redis_client.get(STATS_YOUTUBE_PROJECTS) or 0)
             tiktok_count = int(redis_client.get(STATS_TIKTOK_PROJECTS) or 0)
             instagram_count = int(redis_client.get(STATS_INSTAGRAM_PROJECTS) or 0)
@@ -1387,7 +1391,6 @@ async def add_project_view(project_view: Dict[str, Any]):
     """记录项目浏览信息"""
     try:
         # 验证必需字段
-        logger.info(f"project_view: {project_view}")
         required_fields = ["name", "description", "contract_address", "timestamp", "market_cap"]
         for field in required_fields:
             if field not in project_view:
@@ -1396,7 +1399,6 @@ async def add_project_view(project_view: Dict[str, Any]):
         
         # 生成唯一ID
         view_id = f"{project_view['contract_address']}:{project_view['timestamp']}"
-        logger.info(f"view_id: {view_id}")
         
         # 存储到Redis
         # 1. 存储到集合中
@@ -1433,6 +1435,30 @@ async def add_project_view(project_view: Dict[str, Any]):
         logger.error(f"记录项目浏览信息时出错: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to record project view: {str(e)}")
 
+def convert_market_cap_to_float(market_cap_str: str) -> float:
+    """Convert market cap string (e.g. '$608K', '$1.2M', '$2.5B') to float value"""
+    try:
+        # Remove currency symbol and whitespace
+        value = market_cap_str.strip().replace('$', '').strip()
+        
+        # Get the multiplier based on the suffix
+        multiplier = 1
+        if value.endswith('K'):
+            multiplier = 1000
+            value = value[:-1]
+        elif value.endswith('M'):
+            multiplier = 1000000
+            value = value[:-1]
+        elif value.endswith('B'):
+            multiplier = 1000000000
+            value = value[:-1]
+        
+        # Convert to float and apply multiplier
+        return float(value) * multiplier
+    except (ValueError, AttributeError) as e:
+        logger.error(f"Error converting market cap '{market_cap_str}' to float: {str(e)}")
+        return 0.0
+
 @app.get("/api/project-views")
 async def get_project_views(
     start_time: int = Query(..., description="Start timestamp (in seconds)"),
@@ -1440,12 +1466,15 @@ async def get_project_views(
 ):
     """获取指定时间范围内的项目浏览列表"""
     try:
+        logger.info(f"Getting project views from {start_time} to {end_time}")
+        
         # 从时间排序集合中获取指定范围内的项目ID
         view_ids = redis_client.zrangebyscore(
             PROJECT_VIEWS_BY_TIME,
             start_time,
             end_time
         )
+        logger.info(f"Found {len(view_ids)} view IDs in time range")
         
         # 获取每个项目的详细信息
         project_views = []
@@ -1457,12 +1486,15 @@ async def get_project_views(
                     "description": view_data["description"],
                     "contract_address": view_data["contract_address"],
                     "timestamp": int(view_data["timestamp"]),
-                    "market_cap": float(view_data["market_cap"])
+                    "market_cap": convert_market_cap_to_float(view_data["market_cap"])
                 })
+            else:
+                logger.warning(f"No data found for view_id: {view_id}")
         
         # 按时间戳排序
         project_views.sort(key=lambda x: x["timestamp"])
         
+        logger.info(f"Returning {len(project_views)} project views")
         return {
             "status": "success",
             "project_views": project_views,
@@ -1470,7 +1502,103 @@ async def get_project_views(
         }
     except Exception as e:
         logger.error(f"获取项目浏览列表时出错: {str(e)}")
+        logger.error(f"错误详情: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to get project views: {str(e)}")
+
+@app.get("/api/debug/redis")
+async def debug_redis():
+    """Debug endpoint to check Redis data"""
+    try:
+        # Check if Redis is connected
+        try:
+            redis_info = redis_client.info()
+            logger.info("Successfully connected to Redis")
+        except redis.ConnectionError as e:
+            logger.error(f"Failed to connect to Redis: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Redis connection error: {str(e)}")
+        
+        # Get all keys in the project views set
+        try:
+            view_ids = redis_client.smembers(PROJECT_VIEWS_SET)
+            logger.info(f"Successfully retrieved {len(view_ids)} view IDs from set")
+        except Exception as e:
+            logger.error(f"Failed to get view IDs from set: {str(e)}")
+            view_ids = set()
+        
+        # Get all keys in the time-sorted set
+        try:
+            time_sorted_views = redis_client.zrange(PROJECT_VIEWS_BY_TIME, 0, -1, withscores=True)
+            logger.info(f"Successfully retrieved {len(time_sorted_views)} time-sorted views")
+        except Exception as e:
+            logger.error(f"Failed to get time-sorted views: {str(e)}")
+            time_sorted_views = []
+        
+        # Try to get a sample view data
+        sample_data = None
+        if view_ids:
+            try:
+                sample_id = list(view_ids)[0]
+                sample_data = redis_client.hgetall(f"{PROJECT_VIEW_HASH}{sample_id}")
+                logger.info(f"Successfully retrieved sample data for ID {sample_id}")
+            except Exception as e:
+                logger.error(f"Failed to get sample data: {str(e)}")
+        
+        return {
+            "status": "success",
+            "redis_info": {
+                "connected_clients": redis_info.get("connected_clients"),
+                "used_memory": redis_info.get("used_memory_human"),
+                "total_connections_received": redis_info.get("total_connections_received")
+            },
+            "project_views_set_size": len(view_ids),
+            "time_sorted_views_size": len(time_sorted_views),
+            "sample_view_ids": list(view_ids)[:5] if view_ids else [],
+            "sample_time_sorted_views": time_sorted_views[:5] if time_sorted_views else [],
+            "sample_data": sample_data
+        }
+    except Exception as e:
+        logger.error(f"Debug Redis endpoint error: {str(e)}")
+        logger.error(f"Error details: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to get Redis debug info: {str(e)}")
+
+@app.post("/api/debug/add-test-data")
+async def add_test_data():
+    """Add test data to Redis"""
+    try:
+        # Create a test project view
+        test_view = {
+            "name": "Test Project",
+            "description": "This is a test project",
+            "contract_address": "test123",
+            "timestamp": int(time.time()),
+            "market_cap": 1000000.0
+        }
+        
+        # Generate view ID
+        view_id = f"{test_view['contract_address']}:{test_view['timestamp']}"
+        
+        # Add to set
+        redis_client.sadd(PROJECT_VIEWS_SET, view_id)
+        logger.info(f"Added test view ID to set: {view_id}")
+        
+        # Store details
+        redis_key = f"{PROJECT_VIEW_HASH}{view_id}"
+        redis_client.hset(redis_key, mapping=test_view)
+        logger.info(f"Stored test view details at key: {redis_key}")
+        
+        # Add to time-sorted set
+        redis_client.zadd(PROJECT_VIEWS_BY_TIME, {view_id: float(test_view['timestamp'])})
+        logger.info(f"Added test view to time-sorted set with score: {test_view['timestamp']}")
+        
+        return {
+            "status": "success",
+            "message": "Test data added successfully",
+            "view_id": view_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to add test data: {str(e)}")
+        logger.error(f"Error details: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to add test data: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
