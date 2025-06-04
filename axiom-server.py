@@ -627,7 +627,7 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
                 "contractAddress": normalized_project["contractAddress"],
                 "twitter_info": twitter_info
             }
-            logger.info(f"Broadcasted Twitter info for {normalized_project['name']}: {broadcast_info}")
+            # logger.info(f"Broadcasted Twitter info for {normalized_project['name']}: {broadcast_info}")
             await broadcast_to_clients(broadcast_info)
             
     except Exception as e:
@@ -640,7 +640,7 @@ async def add_meme_project(project: Dict[str, Any]):
         # Normalize project fields to match frontend expectations
         normalized_project = normalize_project(project)
         name = normalized_project["name"]
-        logger.info(f"name: {name}")
+        # logger.info(f"name: {name}")
         
         # 更新统计数据
         update_project_stats(normalized_project)
