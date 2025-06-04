@@ -7,24 +7,18 @@ import time
 import signal
 import sys
 import multiprocessing
-import threading
-import atexit
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Set, Optional, Tuple
+from typing import List, Dict, Any, Set
 import asyncio
 from pprint import pprint
 from datetime import datetime, timedelta
 import logging
-import requests
-from bs4 import BeautifulSoup
-import aiohttp
-import uuid
 import warnings
-import re
-# Import the get_token_info function from pumpfun_comments.py
-from pumpfun_comments import get_token_info
-# Import Twitter utils functions
-from utils.xutils import get_previous_name, get_mentions_ca, get_twitter_labels, get_twitter_user_followers
+import traceback
+# from pumpfun_comments import get_token_info
+from utils.twitter_utils import get_twitter_user
+from utils.common import extract_twitter_handle, extract_tweet_info, fetch_pump_description
+from contextlib import asynccontextmanager
 
 # 禁用urllib3的InsecureRequestWarning警告
 from urllib3.exceptions import InsecureRequestWarning
@@ -75,6 +69,7 @@ STATS_TIKTOK_PROJECTS = "stats:tiktok_projects"
 STATS_INSTAGRAM_PROJECTS = "stats:instagram_projects"
 STATS_NO_SOCIAL_PROJECTS = "stats:no_social_projects"
 STATS_NOT_BROADCAST_PROJECTS = "stats:not_broadcast_projects"  # 新增：不广播的项目数
+STATS_TWITTER_API_CALLS = "stats:twitter_api_calls"  # 新增：Twitter API调用次数
 
 # Initialize Redis client
 redis_client = redis.Redis(
@@ -85,16 +80,70 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
+# Initialize Twitter Redis client (DB 7)
 twitter_redis = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
-    db=3,
+    db=7,
     password=REDIS_PASSWORD,
     decode_responses=True
 )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for FastAPI"""
+    # Startup
+    global FETCH_X_INFO
+    
+    # 显示活跃判断配置
+    logger.info(f"Using activity parameters:")
+    logger.info(f"- Wait time: {PROJECT_WAIT_TIME} seconds")
+    logger.info(f"- ATH market cap threshold: {ATH_MARKET_CAP_THRESHOLD}")
+    logger.info(f"- Activity check interval: {ACTIVITY_CHECK_INTERVAL} seconds")
+    logger.info(f"- Inactive threshold: {INACTIVE_THRESHOLD} consecutive checks")
+    logger.info(f"- Max project age: {MAX_PROJECT_AGE} seconds")
+    
+    # 从Redis加载手动删除的项目列表
+    removed_projects = redis_client.smembers("manually_removed_projects")
+    for mint_address in removed_projects:
+        manually_removed_projects.add(mint_address)
+    logger.info(f"Loaded {len(manually_removed_projects)} manually removed projects")
+    
+    # 从Redis加载已分类的项目列表
+    classified_projects = redis_client.smembers("projects_already_classified")
+    for mint_address in classified_projects:
+        projects_already_classified.add(mint_address)
+    logger.info(f"Loaded {len(projects_already_classified)} previously classified projects")
+    
+    # 从Redis加载X信息获取范围设置
+    x_info_range = redis_client.get("fetch_x_info_range")
+    if x_info_range:
+        FETCH_X_INFO = x_info_range
+        logger.info(f"已从Redis加载X信息获取范围设置: {FETCH_X_INFO}")
+    
+    logger.info("Server startup complete")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Server shutting down")
+    # 设置停止事件
+    stop_event.set()
+    
+    # 等待所有工作进程结束
+    for process in worker_processes:
+        if process.is_alive():
+            try:
+                # 直接使用kill信号
+                process.kill()
+                process.join(timeout=1)  # 给进程1秒来退出
+            except Exception as e:
+                logger.error(f"Error terminating process {process.pid}: {e}")
+    
+    logger.info("All worker processes terminated")
+
 # Initialize FastAPI app
-app = FastAPI(title="Axiom Project Server")
+app = FastAPI(title="Axiom Project Server", lifespan=lifespan)
 
 # Configure CORS
 app.add_middleware(
@@ -127,100 +176,14 @@ project_inactive_count: Dict[str, int] = {}  # mint_address -> 连续不活跃�
 # Process control
 background_process = None
 stop_event = multiprocessing.Event()
+worker_processes = []
+is_shutting_down = False
 
 # 添加一个集合来跟踪被手动删除的项目
 manually_removed_projects: Set[str] = set()  # 存储被手动删除的mint_address
 
 # 全局变量: 控制是否获取X用户信息以及获取范围
 FETCH_X_INFO = "all"  # 可选值: "none", "launchacoin", "all"
-
-# 验证合约地址是否可能有效
-def is_valid_contract_address(contract_address: str) -> bool:
-    """检查合约地址格式是否可能有效"""
-    if not contract_address:
-        return False
-    
-    # 检查合约地址长度是否合理
-    if len(contract_address) < 5 or len(contract_address) > 64:
-        logger.warning(f"合约地址长度异常: '{contract_address}' (长度: {len(contract_address)})")
-        return False
-    
-    # 检查是否包含无效字符
-    valid_chars = set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    if not all(c in valid_chars for c in contract_address):
-        invalid_chars = [c for c in contract_address if c not in valid_chars]
-        logger.warning(f"合约地址包含无效字符: '{contract_address}', 无效字符: {invalid_chars}")
-        return False
-    
-    return True
-
-# Function to fetch pump.fun description
-async def fetch_pump_description(token_contract: str) -> str:
-    """Fetch description from pump.fun for a given token contract."""
-    # 生成请求跟踪ID
-    request_id = str(uuid.uuid4())[:8]
-    
-    # 验证合约地址
-    if not is_valid_contract_address(token_contract):
-        return None
-        
-    try:
-        # 构建URL
-        url = f"https://pump.fun/coin/{token_contract}?include-nsfw=true"
-        
-        # 使用requests库发送请求
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-        
-        # 发送请求，设置5秒超时
-        response = requests.get(url, headers=headers, timeout=5, verify=False)
-        
-        # 检查响应状态
-        if response.status_code != 200:
-            return None
-        
-        # 解析HTML内容
-        html_content = response.text
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # 提取描述信息
-        description = None
-        
-        # 尝试从meta description获取
-        meta_description = soup.find('meta', attrs={'name': 'description'})
-        if meta_description:
-            description = meta_description.get('content')
-            return description
-        
-        # 尝试从og:description获取
-        og_description = soup.find('meta', attrs={'property': 'og:description'})
-        if og_description:
-            description = og_description.get('content')
-            return description
-        
-        # 如果没有找到描述，尝试从其他元素获取
-        desc_divs = soup.find_all('div', class_='text-lg')
-        for div in desc_divs:
-            text = div.get_text().strip()
-            if text:
-                return text
-        
-        # 尝试从段落获取
-        paragraphs = soup.find_all('p')
-        for p in paragraphs:
-            text = p.get_text().strip()
-            if text and len(text) > 30:
-                return text
-        
-        return None
-        
-    except requests.exceptions.RequestException:
-        return None
-    except Exception:
-        return None
 
 # Broadcast to all connected clients
 async def broadcast_to_clients(data: Dict[str, Any]):
@@ -260,256 +223,6 @@ async def broadcast_to_clients(data: Dict[str, Any]):
     
     if broadcast_errors:
         logger.warning(f"广播过程中发生了 {broadcast_errors} 个错误")
-
-# Broadcast active project to clients
-async def broadcast_active_project(mint_address: str, token_info: Dict[str, Any]):
-    """Broadcast an active project to all connected clients"""
-    await broadcast_to_clients({
-        "type": "active_project", 
-        "data": {
-            "mint_address": mint_address,
-            "token_info": token_info
-        }
-    })
-    # logger.info(f"广播活跃项目: {mint_address}")
-    # Add to set of broadcast active projects
-    active_project_broadcasts.add(mint_address)
-
-# Broadcast inactive project to clients
-async def broadcast_inactive_project(mint_address: str):
-    """Broadcast an inactive project to all connected clients"""
-    await broadcast_to_clients({
-        "type": "inactive_project",
-        "data": {
-            "mint_address": mint_address
-        }
-    })
-    # logger.info(f"广播不活跃项目: {mint_address}")
-    # Remove from set of broadcast active projects
-    if mint_address in active_project_broadcasts:
-        active_project_broadcasts.remove(mint_address)
-
-# Check if a project is active based on its history
-def is_project_active(mint_address: str) -> Tuple[bool, Optional[str]]:
-    """
-    检查项目是否活跃基于新的标准:
-    
-    一级列表判断(只判断一次):
-    - 项目存在时间必须超过 PROJECT_WAIT_TIME 秒
-    - ath_market_cap 必须大于 ATH_MARKET_CAP_THRESHOLD
-    - 判断一次后无论结果如何，都不再进入一级判断
-    
-    二级列表判断:
-    - 项目必须在 ath_market_cap、reply_count 有增长或是 is_currently_live 为 True
-    - 连续不活跃 INACTIVE_THRESHOLD 次后才会被剔除
-    
-    返回一个元组 (is_active, reason)
-    """
-    # 首先检查项目是否被手动删除
-    if mint_address in manually_removed_projects:
-        return False, "Manually removed by user"
-        
-    if mint_address not in project_history:
-        return False, "No history"
-    
-    history = project_history[mint_address]
-    if not history:
-        return False, "Empty history"
-    
-    current_time = time.time()
-    latest_record = history[-1]
-    
-    # 检查项目是否已在活跃列表中
-    is_already_active = mint_address in active_projects
-    
-    # 情况1: 项目未经过一级判断
-    if mint_address not in projects_already_classified and not is_already_active:
-        # 第一级判断逻辑
-        
-        # 检查项目是否已经存在足够长时间
-        first_seen_time = project_first_seen.get(mint_address, current_time)
-        time_passed = current_time - first_seen_time
-        
-        if time_passed < PROJECT_WAIT_TIME:
-            return False, f"Too new, only {time_passed:.1f}s old"
-        
-        # 检查ath_market_cap是否超过阈值
-        ath_market_cap = latest_record.get('ath_market_cap')
-        if not ath_market_cap or ath_market_cap < ATH_MARKET_CAP_THRESHOLD:
-            # 添加到已分类集合，以后不再一级判断
-            projects_already_classified.add(mint_address)
-            # 保存已分类项目到Redis
-            redis_client.sadd("projects_already_classified", mint_address)
-            return False, f"ath_market_cap {ath_market_cap} below threshold {ATH_MARKET_CAP_THRESHOLD}"
-        
-        # 项目通过一级判断，添加到已分类集合
-        projects_already_classified.add(mint_address)
-        # 保存已分类项目到Redis
-        redis_client.sadd("projects_already_classified", mint_address)
-        # 设置初始不活跃计数为0
-        project_inactive_count[mint_address] = 0
-        return True, f"New active: ath_market_cap {ath_market_cap} > {ATH_MARKET_CAP_THRESHOLD}"
-    
-    # 情况2: 项目已经通过一级判断且在活跃列表中
-    elif is_already_active:
-        # 第二级判断逻辑: 对已在活跃列表的项目
-        
-        # 需要至少2条记录才能比较变化
-        if len(history) < 2:
-            # 如果只有一条记录但ath_market_cap超过阈值，保持活跃
-            ath_market_cap = latest_record.get('ath_market_cap')
-            if ath_market_cap and ath_market_cap >= ATH_MARKET_CAP_THRESHOLD:
-                # 重置不活跃计数
-                project_inactive_count[mint_address] = 0
-                return True, f"Single record with high ath_market_cap: {ath_market_cap}"
-            
-            # 增加不活跃计数
-            project_inactive_count[mint_address] = project_inactive_count.get(mint_address, 0) + 1
-            
-            # 检查是否达到不活跃阈值
-            if project_inactive_count[mint_address] >= INACTIVE_THRESHOLD:
-                return False, f"Not enough history records to compare after {project_inactive_count[mint_address]} checks"
-            return True, f"Keeping active ({project_inactive_count[mint_address]}/{INACTIVE_THRESHOLD} inactive checks)"
-        
-        # 获取上一条记录和当前记录
-        previous_record = history[-2]
-        
-        # 检查ath_market_cap是否增加
-        current_ath = latest_record.get('ath_market_cap', 0)
-        previous_ath = previous_record.get('ath_market_cap', 0)
-        if current_ath > previous_ath:
-            # 重置不活跃计数
-            project_inactive_count[mint_address] = 0
-            return True, f"ath_market_cap increased: {previous_ath} -> {current_ath}"
-        
-        # 检查reply_count是否增加
-        current_replies = latest_record.get('reply_count', 0)
-        previous_replies = previous_record.get('reply_count', 0)
-        if current_replies > previous_replies:
-            # 重置不活跃计数
-            project_inactive_count[mint_address] = 0
-            return True, f"reply_count increased: {previous_replies} -> {current_replies}"
-        
-        # 检查is_currently_live状态
-        if latest_record.get('is_currently_live', False):
-            # 重置不活跃计数
-            project_inactive_count[mint_address] = 0
-            return True, "is_currently_live is True"
-        
-        # 增加不活跃计数
-        project_inactive_count[mint_address] = project_inactive_count.get(mint_address, 0) + 1
-        
-        # 如果不活跃计数未达到阈值，保持活跃
-        if project_inactive_count[mint_address] < INACTIVE_THRESHOLD:
-            return True, f"Keeping active ({project_inactive_count[mint_address]}/{INACTIVE_THRESHOLD} inactive checks)"
-        
-        # 达到不活跃阈值，从活跃列表中剔除
-        return False, f"No activity increase after {INACTIVE_THRESHOLD} consecutive checks"
-    
-    # 情况3: 项目已经过一级判断但不在活跃列表中
-    else:
-        # 已分类但不在活跃列表的项目，不再重新加入活跃列表
-        return False, "Already classified as inactive"
-
-# Function to fetch activity data in a separate process
-def activity_monitor_process(interval=60):
-    """
-    Separate process for monitoring activity without blocking the main server
-    """
-    # Set up logging for this process
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    process_logger = logging.getLogger("activity_monitor")
-    process_logger.info("Activity monitor process started")
-    process_logger.info(f"Using parameters: WAIT_TIME={PROJECT_WAIT_TIME}s, ATH_THRESHOLD={ATH_MARKET_CAP_THRESHOLD}, CHECK_INTERVAL={ACTIVITY_CHECK_INTERVAL}s")
-    
-    # Create a Redis connection for this process
-    process_redis = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        password=REDIS_PASSWORD,
-        decode_responses=True
-    )
-    
-    # Keep running until the stop event is set
-    while not stop_event.is_set():
-        try:
-            # 减少日志，只在开始时输出一次
-            # process_logger.info("Checking projects activity...")
-            
-            # Get all project IDs from Redis
-            project_ids = process_redis.zrevrange("meme_projects_by_time", 0, -1)
-            processed_count = 0
-            
-            for project_id in project_ids:
-                # Check if we should stop
-                if stop_event.is_set():
-                    break
-                    
-                try:
-                    # Get project data
-                    project_data = process_redis.get(project_id)
-                    if not project_data:
-                        continue
-                    
-                    project = json.loads(project_data)
-                    mint_address = project.get('contractAddress', '')
-                    
-                    # Only process pump.fun tokens (they end with "pump")
-                    if not mint_address or not mint_address.lower().endswith('pump'):
-                        continue
-                    
-                    # 记录项目首次见到的时间
-                    current_time = time.time()
-                    if mint_address not in project_first_seen:
-                        project_first_seen[mint_address] = current_time
-                        # 将首次见到时间存入Redis以便在重启后恢复
-                        process_redis.hset("project_first_seen", mint_address, current_time)
-                    
-                    # Fetch token info using get_token_info
-                    token_info = get_token_info(mint_address)
-                    
-                    # Skip if no token info was returned
-                    if not token_info or not token_info.get('mint'):
-                        continue
-                    
-                    # 移除详细日志
-                    # process_logger.info(f"Fetched token info for {mint_address}")
-                    processed_count += 1
-                    
-                    # Save the token info to a Redis key where the main process can access it
-                    process_redis.set(
-                        f"token_info:{mint_address}", 
-                        json.dumps({
-                            "token_info": token_info,
-                            "timestamp": current_time
-                        })
-                    )
-                    
-                    # Set a short expiry so Redis cleans up old data
-                    process_redis.expire(f"token_info:{mint_address}", 3600)  # 1 hour
-                    
-                except Exception as e:
-                    process_logger.error(f"Error processing project {project_id} 1: {str(e)}")
-            
-            # 周期性输出处理了多少个项目
-            if processed_count > 0:
-                process_logger.info(f"Processed {processed_count} projects")
-            
-        except Exception as e:
-            process_logger.error(f"Activity monitor error: {str(e)}")
-        
-        # Sleep for the interval, but check for stop event every second
-        for _ in range(interval):
-            if stop_event.is_set():
-                break
-            time.sleep(1)
-    
-    process_logger.info("Activity monitor process stopped")
 
 # Fetch data stored by the monitoring process
 async def fetch_token_info_from_redis():
@@ -583,51 +296,6 @@ async def fetch_token_info_from_redis():
                 if len(project_history[mint_address]) > 5:
                     project_history[mint_address] = project_history[mint_address][-5:]
                 
-                # # Check if project is active
-                # # was_active = mint_address in active_projects
-                # # is_active, reason = is_project_active(mint_address)
-                
-                # if is_active:
-                #     active_count += 1
-                    
-                #     # 检查是否是新活跃的项目
-                #     if not was_active:
-                #         # 输出详细的新活跃项目信息
-                #         logger.info(f"新的活跃项目 - {mint_address}:")
-                #         logger.info(f"  名称: {token_info.get('name', '未知')}")
-                #         logger.info(f"  符号: {token_info.get('symbol', '未知')}")
-                #         logger.info(f"  创建时间: {token_info.get('created_timestamp', '未知')}")
-                #         logger.info(f"  回复数: {token_info.get('reply_count', '未知')}")
-                #         logger.info(f"  最高市值: {token_info.get('ath_market_cap', '未知')}")
-                #         logger.info(f"  实时状态: {token_info.get('is_currently_live', False)}")
-                #         logger.info(f"  活跃原因: {reason}")
-                        
-                #         if 'image_uri' in token_info:
-                #             logger.info(f"  图片地址: {token_info['image_uri']}")
-                        
-                #         if 'description' in token_info:
-                #             # 截取描述前100个字符，如果描述过长则添加省略号
-                #             desc = token_info['description']
-                #             if len(desc) > 100:
-                #                 desc = desc[:100] + "..."
-                #             logger.info(f"  描述: {desc}")
-                    
-                #     # Store in active projects if not already broadcast
-                #     active_projects[mint_address] = token_info
-                    
-                #     # Broadcast if not already broadcast
-                #     if mint_address not in active_project_broadcasts:
-                #         await broadcast_active_project(mint_address, token_info)
-                # else:
-                #     # If was active but now inactive
-                #     if mint_address in active_projects:
-                #         logger.info(f"项目变为非活跃状态 - {mint_address}: {token_info.get('name', '未知')}, 原因: {reason}")
-                #         del active_projects[mint_address]
-                        
-                #         # Broadcast inactive status if it was previously broadcast as active
-                #         if mint_address in active_project_broadcasts:
-                #             await broadcast_inactive_project(mint_address)
-                
             except Exception as e:
                 logger.error(f"Error processing token info for {key}: {str(e)}")
         
@@ -646,107 +314,80 @@ async def sync_token_info_task():
     except asyncio.CancelledError:
         logger.info("Token info sync task cancelled")
 
-# Start the monitoring process
-def start_activity_monitor():
-    """Start the activity monitoring process"""
-    global background_process, stop_event
-    
-    # Make sure the stop event is cleared
-    stop_event.clear()
-    
-    # Start the process
-    background_process = multiprocessing.Process(
-        target=activity_monitor_process,
-        args=(ACTIVITY_CHECK_INTERVAL,),
-        daemon=True  # Set as daemon so it exits when the main process exits
-    )
-    background_process.start()
-    logger.info(f"Started activity monitor process (PID: {background_process.pid})")
-
-# Stop the monitoring process gracefully
-def stop_activity_monitor():
-    """Stop the activity monitoring process"""
-    global background_process, stop_event
-    
-    if background_process and background_process.is_alive():
-        logger.info(f"Stopping activity monitor process (PID: {background_process.pid})")
+def worker_process(stop_event):
+    """工作进程函数"""
+    try:
+        # 设置工作进程的信号处理
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # 忽略 SIGINT
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # 忽略 SIGTERM
         
-        # Set the stop event to signal the process
-        stop_event.set()
+        logger.info(f"Worker process {os.getpid()} started")
         
-        # Wait for process to terminate (with timeout)
-        background_process.join(timeout=5)
-        
-        # If still alive, terminate more forcefully
-        if background_process.is_alive():
-            logger.info("Activity monitor process didn't stop gracefully, terminating...")
-            background_process.terminate()
-            background_process.join(timeout=2)
+        # 运行工作进程
+        while True:
+            # 检查停止事件
+            if stop_event.is_set():
+                logger.info(f"Worker process {os.getpid()} received stop signal")
+                break
+                
+            try:
+                # 使用更短的睡眠间隔，以便更快地响应停止信号
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Worker process {os.getpid()} sleep error: {e}")
+                break
             
-            # Last resort: kill
-            if background_process.is_alive():
-                logger.warning("Forcefully killing activity monitor process")
-                # On Unix systems, SIGKILL forces termination
-                os.kill(background_process.pid, signal.SIGKILL)
-        
-        logger.info("Activity monitor process stopped")
+    except Exception as e:
+        logger.error(f"Worker process {os.getpid()} error: {e}")
+    finally:
+        logger.info(f"Worker process {os.getpid()} exiting")
+        # 确保进程立即退出
+        os._exit(0)
 
-# Ensure process is stopped on exit
-atexit.register(stop_activity_monitor)
-
-# Startup event to start the background process
-@app.on_event("startup")
-async def startup_event():
-    """Start necessary background tasks"""
-    global FETCH_X_INFO
-    
-    # 显示活跃判断配置
-    logger.info(f"Using activity parameters:")
-    logger.info(f"- Wait time: {PROJECT_WAIT_TIME} seconds")
-    logger.info(f"- ATH market cap threshold: {ATH_MARKET_CAP_THRESHOLD}")
-    logger.info(f"- Activity check interval: {ACTIVITY_CHECK_INTERVAL} seconds")
-    logger.info(f"- Inactive threshold: {INACTIVE_THRESHOLD} consecutive checks")
-    logger.info(f"- Max project age: {MAX_PROJECT_AGE} seconds")
-    
-    # 从Redis加载手动删除的项目列表
-    removed_projects = redis_client.smembers("manually_removed_projects")
-    for mint_address in removed_projects:
-        manually_removed_projects.add(mint_address)
-    logger.info(f"Loaded {len(manually_removed_projects)} manually removed projects")
-    
-    # 从Redis加载已分类的项目列表
-    classified_projects = redis_client.smembers("projects_already_classified")
-    for mint_address in classified_projects:
-        projects_already_classified.add(mint_address)
-    logger.info(f"Loaded {len(projects_already_classified)} previously classified projects")
-    
-    # 从Redis加载X信息获取范围设置
-    x_info_range = redis_client.get("fetch_x_info_range")
-    if x_info_range:
-        FETCH_X_INFO = x_info_range
-        logger.info(f"已从Redis加载X信息获取范围设置: {FETCH_X_INFO}")
-    
-    # Start the activity monitor process
-    # start_activity_monitor()
-    
-    # Start the data sync task
-    # asyncio.create_task(sync_token_info_task())
-    
-    logger.info("Server startup complete")
-
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("Server shutting down")
-    stop_activity_monitor()
-
-# Signal handler
 def handle_exit_signal(signum, frame):
     """Handle exit signals like SIGINT (Ctrl+C) and SIGTERM"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    stop_activity_monitor()
-    sys.exit(0)
+    global is_shutting_down
+    
+    # 如果已经在关闭过程中，忽略重复的信号
+    if is_shutting_down:
+        logger.info("Already in shutdown process, ignoring signal")
+        return
+        
+    is_shutting_down = True
+    
+    if signum == signal.SIGTERM:
+        logger.info(f"Received SIGTERM signal, shutting down...")
+    elif signum == signal.SIGINT:
+        logger.info(f"Received SIGINT signal (Ctrl+C), shutting down...")
+    else:
+        logger.info(f"Received signal {signum}, shutting down...")
+    
+    # 设置停止事件
+    stop_event.set()
+    
+    # 确保所有资源都被清理
+    try:
+        # 关闭Redis连接
+        redis_client.close()
+        twitter_redis.close()
+        logger.info("Redis connections closed")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+    
+    # 等待所有工作进程结束
+    for process in worker_processes:
+        if process.is_alive():
+            try:
+                # 直接使用kill信号
+                process.kill()
+                process.join(timeout=1)  # 给进程1秒来退出
+            except Exception as e:
+                logger.error(f"Error terminating process {process.pid}: {e}")
+    
+    logger.info("All worker processes terminated")
+    
+    # 强制退出
+    os._exit(0)
 
 # 恢复 WebSocket 端点
 @app.websocket("/ws")
@@ -933,25 +574,116 @@ def is_duplicate_project(project: dict) -> bool:
 async def root():
     return {"message": "WebSocket server is running"}
 
-# 恢复API路由处理程序
+# 添加一个新的异步函数来处理Twitter信息获取和广播
+async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], twitter_handle: str):
+    """异步获取Twitter信息并广播"""
+    try:
+        # 先检查是否是名人
+        is_celebrity = twitter_redis.sismember("twitter:celebrities", twitter_handle.lower())
+        
+        if is_celebrity:
+            # 如果是名人，直接从 Redis 获取用户信息
+            user_info = twitter_redis.get(twitter_handle)
+            if user_info:
+                try:
+                    twitter_info = json.loads(user_info)
+                    logger.info(f"Using celebrity info for {twitter_handle}")
+                except json.JSONDecodeError:
+                    twitter_info = None
+        else:
+            # 如果不是名人，检查缓存
+            expire_key = f"{twitter_handle}:expire"
+            
+            # 检查缓存是否存在
+            if twitter_redis.exists(expire_key):
+                # 缓存存在，直接从 Redis 获取用户信息
+                user_info = twitter_redis.get(twitter_handle)
+                if user_info:
+                    try:
+                        twitter_info = json.loads(user_info)
+                        logger.info(f"Using cached Twitter info for {twitter_handle}")
+                    except json.JSONDecodeError:
+                        twitter_info = None
+            else:
+                # 缓存不存在，调用 API 获取信息
+                twitter_info = get_twitter_user(twitter_handle)
+                if twitter_info:
+                    # 增加Twitter API调用计数
+                    redis_client.incr(STATS_TWITTER_API_CALLS)
+                    # 设置缓存过期时间
+                    twitter_redis.setex(expire_key, 7200, "1")
+                    logger.info(f"Set new cache for {twitter_handle}")
+        
+        # 如果获取到Twitter信息，更新项目并广播
+        if twitter_info:
+            # 创建项目副本并添加Twitter信息
+            project_with_twitter = normalized_project.copy()
+            project_with_twitter["twitter_info"] = twitter_info
+            
+            # 广播更新后的项目信息
+            broadcast_info = {}
+            broadcast_info["type"] = "twitter_info_update"
+            broadcast_info["data"] = {
+                "contractAddress": normalized_project["contractAddress"],
+                "twitter_info": twitter_info
+            }
+            logger.info(f"Broadcasted Twitter info for {normalized_project['name']}: {broadcast_info}")
+            await broadcast_to_clients(broadcast_info)
+            
+    except Exception as e:
+        logger.error(f"Error fetching Twitter info for {twitter_handle}: {e}")
+
+# 修改 add_meme_project 函数中的相关部分
 @app.post("/api/meme-projects")
 async def add_meme_project(project: Dict[str, Any]):
     try:
         # Normalize project fields to match frontend expectations
         normalized_project = normalize_project(project)
         name = normalized_project["name"]
+        logger.info(f"name: {name}")
         
         # 更新统计数据
         update_project_stats(normalized_project)
+        
+        # 检查是否有社交媒体
+        has_hover_tweet = bool(normalized_project.get("hoverTweet"))
+        has_links = bool(normalized_project.get("links"))
+        has_pump_only = False
+        has_social_media = False
+        
+        if has_links:
+            links = normalized_project["links"]
+            if isinstance(links, dict):
+                # 检查是否只有pump.fun链接
+                has_pump_only = all(
+                    "pump.fun" in v for v in links.values() if isinstance(v, str)
+                ) and len(links) > 0
+                
+                # 检查是否有社交媒体链接
+                social_platforms = ["twitter.com", "x.com", "t.me", "discord.com", "discord.gg"]
+                has_social_media = any(
+                    any(platform in v for platform in social_platforms)
+                    for v in links.values() if isinstance(v, str)
+                )
+        
+        # 判断是否有社交媒体
+        has_social_media = has_hover_tweet or (has_links and not has_pump_only) or has_social_media
+        
+        # 如果无社交媒体，不广播并增加不广播计数
+        if not has_social_media and not normalized_project["website"]:
+            redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
+            return {"status": "ignored", "message": "Project ignored due to no social media"}
         
         # 检查是否需要获取Twitter信息
         should_fetch_x_info = False
         twitter_handle = None
         
-        if FETCH_X_INFO == "all":
-            should_fetch_x_info = True
-        elif FETCH_X_INFO == "launchacoin" and normalized_project.get("from") == "launchacoin":
-            should_fetch_x_info = True
+        # 只有在有社交媒体的情况下才考虑获取Twitter信息
+        if has_social_media:
+            if FETCH_X_INFO == "all":
+                should_fetch_x_info = True
+            elif FETCH_X_INFO == "launchacoin" and normalized_project.get("from") == "launchacoin":
+                should_fetch_x_info = True
         
         # 如果需要获取Twitter信息，尝试从项目链接或hoverTweet中提取Twitter用户名
         if should_fetch_x_info:
@@ -967,14 +699,11 @@ async def add_meme_project(project: Dict[str, Any]):
             if not twitter_handle and "hoverTweet" in normalized_project and isinstance(normalized_project["hoverTweet"], str):
                 twitter_handle = extract_twitter_handle(normalized_project["hoverTweet"])
             
-            # 如果找到Twitter用户名，获取信息
+            # 如果找到Twitter用户名，异步获取信息
             if twitter_handle:
-                twitter_info = get_twitter_complete_info(twitter_handle)
-                
-                # 将Twitter信息添加到项目中
-                if twitter_info:
-                    normalized_project["twitter_info"] = twitter_info
-        
+                # 创建异步任务获取Twitter信息
+                asyncio.create_task(fetch_and_broadcast_twitter_info(normalized_project, twitter_handle))
+
         # ========== 新增：推文去重与时间阈值判断 ==========
         tweet_info = None
         # 检查 links
@@ -1018,25 +747,7 @@ async def add_meme_project(project: Dict[str, Any]):
         if normalized_project["from"] == "launchacoin":
             twitter_redis.sadd(f"twitter:{twitter_handle}:mentioned_contracts_set", *set([normalized_project["contractAddress"]]))
 
-        # 检查是否无社交媒体
-        has_hover_tweet = bool(normalized_project.get("hoverTweet"))
-        has_links = bool(normalized_project.get("links"))
-        has_pump_only = False
-        
-        if has_links:
-            links = normalized_project["links"]
-            if isinstance(links, dict):
-                # 检查是否只有pump.fun链接
-                has_pump_only = all(
-                    "pump.fun" in v for v in links.values() if isinstance(v, str)
-                ) and len(links) > 0
-        
-        # 如果无社交媒体，不广播并增加不广播计数
-        if not has_hover_tweet and (not has_links or has_pump_only) and not normalized_project["website"]:
-            redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
-            return {"status": "ignored", "message": "Project ignored due to no social media"}
-        
-        # Broadcast to all connected WebSocket clients
+        # 立即广播项目信息（不包含Twitter信息）
         await broadcast_to_clients({"type": "new_project", "data": normalized_project})
         
         return {"status": "success", "message": "Project added successfully"}
@@ -1095,61 +806,6 @@ async def get_meme_projects(
         logger.error(f"错误详情: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to get projects: {str(e)}")
 
-# 添加获取活跃项目API路由
-@app.get("/api/active-projects")
-async def get_active_projects():
-    """Return list of currently active projects"""
-    try:
-        # 将活跃项目转换为列表格式
-        projects_list = [
-            {"mint_address": mint_address, "token_info": token_info} 
-            for mint_address, token_info in active_projects.items()
-        ]
-        
-        # 按照回复数降序排序
-        projects_list.sort(
-            key=lambda p: (p["token_info"].get("reply_count", 0) if p["token_info"] else 0),
-            reverse=True
-        )
-        
-        return {
-            "status": "success",
-            "active_projects": projects_list
-        }
-    except Exception as e:
-        logger.error(f"获取活跃项目列表时出错: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get active projects: {str(e)}")
-
-# 添加API端点用于手动删除活跃项目
-@app.delete("/api/active-projects/{mint_address}")
-async def remove_active_project(mint_address: str):
-    """Manually remove a project from the active list"""
-    try:
-        # 检查项目是否在活跃列表中
-        if mint_address not in active_projects:
-            raise HTTPException(status_code=404, detail=f"Project with mint address {mint_address} not found in active list")
-            
-        # 从活跃列表中删除项目
-        project_name = active_projects[mint_address].get("name", "Unknown")
-        del active_projects[mint_address]
-        
-        # 添加到手动删除集合
-        manually_removed_projects.add(mint_address)
-        
-        # 将手动删除的项目保存到Redis以便服务重启后保持状态
-        redis_client.sadd("manually_removed_projects", mint_address)
-        
-        # 广播项目不活跃状态
-        if mint_address in active_project_broadcasts:
-            await broadcast_inactive_project(mint_address)
-            
-        logger.info(f"项目已被手动删除 - {mint_address}: {project_name}")
-        
-        return {"status": "success", "message": f"Project {project_name} ({mint_address}) has been removed from active list"}
-    except Exception as e:
-        logger.error(f"删除活跃项目出错: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to remove active project: {str(e)}")
-
 # 新增API端点: 设置X信息获取范围
 @app.post("/api/set-xinfo-range")
 async def set_xinfo_range(range: str):
@@ -1168,152 +824,6 @@ async def set_xinfo_range(range: str):
     
     logger.info(f"已设置X信息获取范围为: {range}")
     return {"status": "success", "message": f"X info fetch range set to: {range}"}
-
-# 提取Twitter用户名函数
-def extract_twitter_handle(url: str) -> Optional[str]:
-    """从Twitter URL中提取用户名"""
-    # 处理 x.com 或 twitter.com 的URL格式
-    pattern = r'(?:https?:\/\/)?(?:www\.)?(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)(?:\/status\/\d+)?'
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-    return None
-
-# 获取Twitter完整信息函数
-def get_twitter_complete_info(username: str) -> Dict[str, Any]:
-    """获取Twitter用户的完整信息，并行执行三个函数并存储结果到Redis DB 3"""
-    result = {}
-    
-    # 记录日志
-    # logger.info(f"正在获取Twitter用户信息: {username}")
-    
-    try:
-        
-        # 获取当前时间戳
-        current_time = time.time()
-        
-        # 先检查Redis是否已有完整信息
-        cached_info = twitter_redis.hgetall(f"twitter:{username}:complete_info")
-        
-        # 如果有缓存数据且数据不超过1天，直接返回
-        if cached_info and "data" in cached_info and "timestamp" in cached_info:
-            cached_timestamp = float(cached_info["timestamp"])
-            if current_time - cached_timestamp < 86400:  # 数据不超过1天
-                # logger.info(f"使用Redis缓存中的Twitter用户信息: {username} (缓存时间: {int(current_time - cached_timestamp)}秒)")
-                try:
-                    return json.loads(cached_info["data"])
-                except Exception as e:
-                    logger.error(f"解析Redis缓存的Twitter数据时出错: {str(e)}")
-                    # 解析失败，继续请求新数据
-        
-        # 创建并行执行的线程
-        import concurrent.futures
-        
-        def fetch_previous_name():
-            try:
-                prev_name_info = get_previous_name(username)
-                # 存储到Redis
-                if prev_name_info:
-                    twitter_redis.hset(
-                        f"twitter:{username}:previous_names",
-                        mapping={
-                            "data": json.dumps(prev_name_info),
-                            "timestamp": current_time
-                        }
-                    )
-                return prev_name_info
-            except Exception as e:
-                logger.error(f"获取曾用名信息出错: {str(e)}")
-                return None
-        
-        def fetch_mentions_ca():
-            mentions_ca_info = None
-            try:
-                mentions_ca_info = get_mentions_ca(username)
-                if mentions_ca_info["success"]:
-                    if "data" in mentions_ca_info:
-                        mentioned_contracts_set = set(mentions_ca_info["data"])
-                        if mentioned_contracts_set:
-                            twitter_redis.sadd(f"twitter:{username}:mentioned_contracts_set", *mentioned_contracts_set)
-                return mentions_ca_info 
-            except Exception as e:
-                logger.error(f"获取提及CA信息出错: {str(e)}, {username}, {mentions_ca_info}")
-                return None
-        
-        def fetch_followers_info():
-            try:
-                followers_info = get_twitter_user_followers(username)
-                # 存储到Redis
-                if followers_info:
-                    twitter_redis.hset(
-                        f"twitter:{username}:followers_info",
-                        mapping={
-                            "data": json.dumps(followers_info),
-                            "timestamp": current_time
-                        }
-                    )
-                return followers_info
-            except Exception as e:
-                logger.error(f"获取关注者信息出错: {str(e)}")
-                return None
-        
-        # 使用线程池并行执行三个函数
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # 提交任务到线程池
-            prev_name_future = executor.submit(fetch_previous_name)
-            mentions_ca_future = executor.submit(fetch_mentions_ca)
-            followers_future = executor.submit(fetch_followers_info)
-            
-            # 等待所有任务完成并获取结果
-            prev_name_info = prev_name_future.result()
-            mentions_ca_info = mentions_ca_future.result()
-            followers_info = followers_future.result()
-        
-        # 处理曾用名信息
-        if prev_name_info and prev_name_info.get("success"):
-            result["previous_names"] = prev_name_info.get("data", [])
-        
-        # 处理提及的CA信息
-        if mentions_ca_info and mentions_ca_info.get("success"):
-            result["mentioned_contracts"] = len(mentions_ca_info.get("data", []))
-        
-        # 处理关注者信息
-        if followers_info and followers_info.get("code") == 200:
-            kol_data = followers_info.get("data", {}).get("kolFollow", {})
-            result["kols"] = {
-                "globalKolFollowersCount": kol_data.get("globalKolFollowersCount", 0),
-                "cnKolFollowersCount": kol_data.get("cnKolFollowersCount", 0),
-                "topKolFollowersCount": kol_data.get("topKolFollowersCount", 0),
-                "globalKolFollowers": [f.get("username") for f in kol_data.get("globalKolFollowers", [])],
-                "cnKolFollowers": [f.get("username") for f in kol_data.get("cnKolFollowers", [])],
-                "topKolFollowers": [f.get("username") for f in kol_data.get("topKolFollowers", [])]
-            }
-        
-        # 存储完整的合并结果到Redis
-        twitter_redis.hset(
-            f"twitter:{username}:complete_info",
-            mapping={
-                "data": json.dumps(result),
-                "timestamp": current_time
-            }
-        )
-        
-        # 返回合并的结果
-        return result
-        
-    except Exception as e:
-        logger.error(f"获取Twitter用户信息时出错: {str(e)}")
-        return {"error": str(e)}
-
-def extract_tweet_info(text: str) -> Optional[Tuple[str, str]]:
-    """
-    从文本中提取 x.com/twitter.com 推文的 user 和 tweet_id
-    """
-    pattern = r"(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/([a-zA-Z0-9_]+)/status/(\d+)"
-    match = re.search(pattern, text)
-    if match:
-        return match.group(1), match.group(2)
-    return None
 
 def update_project_stats(normalized_project: Dict[str, Any]):
     """更新项目统计数据"""
@@ -1364,7 +874,8 @@ def update_project_stats(normalized_project: Dict[str, Any]):
             instagram_count = int(redis_client.get(STATS_INSTAGRAM_PROJECTS) or 0)
             no_social_count = int(redis_client.get(STATS_NO_SOCIAL_PROJECTS) or 0)
             not_broadcast_count = int(redis_client.get(STATS_NOT_BROADCAST_PROJECTS) or 0)
-            logger.info(f"统计值 [总数: {total}] [YouTube: {youtube_count}] [TikTok: {tiktok_count}] [Instagram: {instagram_count}] [无社交: {no_social_count}] [不广播: {not_broadcast_count}]")
+            twitter_api_calls = int(redis_client.get(STATS_TWITTER_API_CALLS) or 0)
+            logger.info(f"统计值 [总数: {total}] [YouTube: {youtube_count}] [TikTok: {tiktok_count}] [Instagram: {instagram_count}] [无社交: {no_social_count}] [不广播: {not_broadcast_count}] [Twitter API调用: {twitter_api_calls}]")
             
     except Exception as e:
         logger.error(f"更新统计数据时出错: {str(e)}")
@@ -1379,7 +890,8 @@ async def get_project_stats():
             "tiktok_projects": int(redis_client.get(STATS_TIKTOK_PROJECTS) or 0),
             "instagram_projects": int(redis_client.get(STATS_INSTAGRAM_PROJECTS) or 0),
             "no_social_projects": int(redis_client.get(STATS_NO_SOCIAL_PROJECTS) or 0),
-            "not_broadcast_projects": int(redis_client.get(STATS_NOT_BROADCAST_PROJECTS) or 0)
+            "not_broadcast_projects": int(redis_client.get(STATS_NOT_BROADCAST_PROJECTS) or 0),
+            "twitter_api_calls": int(redis_client.get(STATS_TWITTER_API_CALLS) or 0)  # 新增：Twitter API调用次数
         }
         return {"status": "success", "stats": stats}
     except Exception as e:
@@ -1603,28 +1115,52 @@ async def add_test_data():
 if __name__ == "__main__":
     import uvicorn
     
-    # Register signal handlers
-    signal.signal(signal.SIGINT, handle_exit_signal)  # Ctrl+C
-    signal.signal(signal.SIGTERM, handle_exit_signal)  # kill command
-    
     # Configure uvicorn
     config = uvicorn.Config(
-        "main:app", 
+        "axiom-server:app",  # 更新为新的文件名
         host="192.168.1.2", 
         port=5001, 
         reload=False,
         log_level="info",
         access_log=False,  # 禁用HTTP请求访问日志
-        workers=8
+        workers=24,  # 使用24个工作进程
+        limit_concurrency=1000,  # 限制并发连接数
+        backlog=2048  # 增加等待队列大小
     )
     
     # Run the server
     try:
         server = uvicorn.Server(config)
+        
+        # 在主进程中注册信号处理器
+        signal.signal(signal.SIGINT, handle_exit_signal)  # Ctrl+C
+        signal.signal(signal.SIGTERM, handle_exit_signal)  # kill command
+        
+        # 启动工作进程
+        for _ in range(config.workers):
+            process = multiprocessing.Process(target=worker_process, args=(stop_event,))
+            process.daemon = True  # 设置为守护进程
+            process.start()
+            worker_processes.append(process)
+            logger.info(f"Started worker process {process.pid}")
+        
+        logger.info("Server starting...")
+        # 运行服务器
         server.run()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
+        handle_exit_signal(signal.SIGINT, None)
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        handle_exit_signal(signal.SIGTERM, None)
     finally:
-        # Make sure process is stopped
-        stop_activity_monitor()
+        # 确保所有进程都被终止
+        for process in worker_processes:
+            if process.is_alive():
+                try:
+                    # 直接使用kill信号
+                    process.kill()
+                    process.join(timeout=1)  # 给进程1秒来退出
+                except Exception as e:
+                    logger.error(f"Error terminating process {process.pid}: {e}")
         logger.info("Server shutdown complete") 
