@@ -17,6 +17,7 @@ import warnings
 import traceback
 # from pumpfun_comments import get_token_info
 from utils.twitter_utils import get_twitter_user
+from utils.twitter_user_info import get_twitter_community_info
 from utils.common import extract_twitter_handle, extract_tweet_info, fetch_pump_description
 from contextlib import asynccontextmanager
 
@@ -574,6 +575,22 @@ def is_duplicate_project(project: dict) -> bool:
 async def root():
     return {"message": "WebSocket server is running"}
 
+async def fetch_and_broadcast_community_info(normalized_project: Dict[str, Any], community_id: str):
+    try:
+        community_info = get_twitter_community_info(community_id)
+        broadcast_info = {}
+        broadcast_info["type"] = "community_info_update"
+        broadcast_info["data"] = {
+            "contractAddress": normalized_project["contractAddress"],
+            "community_info": community_info['community_info']
+        }
+        logger.info(f"Broadcasted Community info {normalized_project['name']}: {broadcast_info}")
+        await broadcast_to_clients(broadcast_info)
+
+    except Exception as e:
+        logger.error(f"Error fetching Twitter info for {community_id}: {e}")
+    ...
+
 # 添加一个新的异步函数来处理Twitter信息获取和广播
 async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], twitter_handle: str):
     """异步获取Twitter信息并广播"""
@@ -640,7 +657,6 @@ async def add_meme_project(project: Dict[str, Any]):
         # Normalize project fields to match frontend expectations
         normalized_project = normalize_project(project)
         name = normalized_project["name"]
-        # logger.info(f"name: {name}")
         
         # 更新统计数据
         update_project_stats(normalized_project)
@@ -650,6 +666,7 @@ async def add_meme_project(project: Dict[str, Any]):
         has_links = bool(normalized_project.get("links"))
         has_pump_only = False
         has_social_media = False
+        
         
         if has_links:
             links = normalized_project["links"]
@@ -673,6 +690,10 @@ async def add_meme_project(project: Dict[str, Any]):
         if not has_social_media and not normalized_project["website"]:
             redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
             return {"status": "ignored", "message": "Project ignored due to no social media"}
+
+        # 立即广播项目信息（不包含Twitter作者信息和Twitter社区信息）
+        await broadcast_to_clients({"type": "new_project", "data": normalized_project})
+        logger.info(f"broadcast: {name}: {normalized_project['contractAddress']}")
         
         # 检查是否需要获取Twitter信息
         should_fetch_x_info = False
@@ -703,6 +724,7 @@ async def add_meme_project(project: Dict[str, Any]):
             if twitter_handle:
                 # 创建异步任务获取Twitter信息
                 asyncio.create_task(fetch_and_broadcast_twitter_info(normalized_project, twitter_handle))
+        
 
         # ========== 新增：推文去重与时间阈值判断 ==========
         tweet_info = None
@@ -747,8 +769,16 @@ async def add_meme_project(project: Dict[str, Any]):
         if normalized_project["from"] == "launchacoin":
             twitter_redis.sadd(f"twitter:{twitter_handle}:mentioned_contracts_set", *set([normalized_project["contractAddress"]]))
 
-        # 立即广播项目信息（不包含Twitter信息）
-        await broadcast_to_clients({"type": "new_project", "data": normalized_project})
+        
+
+        # 检查xLink字段是否为社区链接
+        if "xLink" in normalized_project and isinstance(normalized_project["xLink"], str):
+            if normalized_project["xLink"].startswith("https://x.com/i/communities/"):
+                # 提取社区ID
+                community_id = normalized_project["xLink"].split("/")[-1]
+                if community_id:
+                    # 异步获取并广播社区信息
+                    asyncio.create_task(fetch_and_broadcast_community_info(normalized_project, community_id))
         
         return {"status": "success", "message": "Project added successfully"}
     except Exception as e:

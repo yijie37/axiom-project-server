@@ -71,10 +71,79 @@ def get_twitter_user_info(username):
         print(f"Error occurred: {e}")
         return None
 
+def preprocess_creator_data(creator_data):
+    """
+    Preprocess creator data to match the expected format in update_redis_user_info
+    """
+    return {
+        'userName': creator_data.get('screen_name', ''),
+        'id': creator_data.get('id', ''),
+        'name': creator_data.get('name', ''),
+        'description': creator_data.get('description', ''),
+        'following': creator_data.get('following_count', 0),
+        'followers': creator_data.get('followers_count', 0),
+        'coverPicture': creator_data.get('profile_banner_url', '')
+    }
+
+def get_twitter_community_info(community_id):
+    url = "https://api.twitterapi.io/twitter/community/info"
+    
+    querystring = {"community_id": community_id}
+    
+    # Get API key from environment variable
+    api_key = "2bf06adbe2a746deb2f4229dc60a935d"
+    # api_key = os.getenv('TWITTER_API_KEY')
+    if not api_key:
+        raise ValueError("TWITTER_API_KEY not found in environment variables")
+    
+    headers = {"X-API-Key": api_key}
+    
+    try:
+        response = requests.request("GET", url, headers=headers, params=querystring)
+        response.raise_for_status()
+        result = response.json()
+        
+        if result.get('status') == 'success' and 'community_info' in result:
+            community_info = result['community_info']
+            
+            # Process creator information and update Redis
+            if 'creator' in community_info:
+                redis_client = redis.Redis(db=7)
+                # Preprocess creator data before updating Redis
+                processed_creator_data = preprocess_creator_data(community_info['creator'])
+                update_redis_user_info(redis_client, processed_creator_data)
+                redis_client.close()
+            
+            # Extract and format community and creator information
+            info = {
+                'comm_name': community_info['name'],
+                'comm_desc': community_info['description'],
+                'comm_banner_url': community_info['banner_url'],
+                'member_count': community_info['member_count'],
+                'mod_count': community_info['moderator_count'],
+                'creator_name': community_info['creator']['name'],
+                'creator_description': community_info['creator']['description'],
+                'creator_followers_count': community_info['creator']['followers_count'],
+                'creator_statuses_count': community_info['creator']['statuses_count'],
+                'creator_avtar': community_info['creator']['profile_image_url_https']
+            }
+            
+            return {
+                'status': 'success',
+                'community_info': info,
+                'raw_data': result
+            }
+        
+        return result
+    except requests.exceptions.RequestException as e:
+        print(f"Error occurred: {e}")
+        return None
+
 if __name__ == "__main__":
+    # Test community info
     start_time = time.time()
-    result = get_twitter_user_info("elonmusk")
+    result = get_twitter_community_info("1931138282429054982")
     end_time = time.time()
     print(f"Time taken: {end_time - start_time} seconds")
     if result:
-        print(json.dumps(result, indent=2))
+        print(json.dumps(result['community_info'], indent=2))
