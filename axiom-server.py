@@ -577,19 +577,39 @@ async def root():
 
 async def fetch_and_broadcast_community_info(normalized_project: Dict[str, Any], community_id: str):
     try:
-        community_info = get_twitter_community_info(community_id)
-        broadcast_info = {}
-        broadcast_info["type"] = "community_info_update"
-        broadcast_info["data"] = {
-            "contractAddress": normalized_project["contractAddress"],
-            "community_info": community_info['community_info']
-        }
-        logger.info(f"Broadcasted Community info {normalized_project['name']}: {broadcast_info}")
-        await broadcast_to_clients(broadcast_info)
+        # 检查Redis缓存
+        community_key = f"community:{community_id}"
+        community_info = None
+        
+        # 尝试从Redis获取缓存的社区信息
+        cached_info = redis_client.get(community_key)
+        if cached_info:
+            try:
+                community_info = json.loads(cached_info)
+                logger.info(f"Using cached community info for {community_id}")
+            except json.JSONDecodeError:
+                community_info = None
+        
+        # 如果缓存不存在或无效，则调用API获取
+        if not community_info:
+            community_info = get_twitter_community_info(community_id)
+            if community_info and community_info.get('status') == 'success':
+                # 缓存社区信息，设置16天过期时间
+                redis_client.setex(community_key, 3600 * 24 * 16, json.dumps(community_info))
+                logger.info(f"Cached new community info for {community_id}")
+        
+        if community_info and community_info.get('status') == 'success':
+            broadcast_info = {}
+            broadcast_info["type"] = "community_info_update"
+            broadcast_info["data"] = {
+                "contractAddress": normalized_project["contractAddress"],
+                "community_info": community_info['community_info']
+            }
+            logger.info(f"Broadcasted Community info {normalized_project['name']}: {broadcast_info}")
+            await broadcast_to_clients(broadcast_info)
 
     except Exception as e:
         logger.error(f"Error fetching Twitter info for {community_id}: {e}")
-    ...
 
 # 添加一个新的异步函数来处理Twitter信息获取和广播
 async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], twitter_handle: str):
