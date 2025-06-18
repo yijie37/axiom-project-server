@@ -605,7 +605,8 @@ async def fetch_and_broadcast_community_info(normalized_project: Dict[str, Any],
                 "contractAddress": normalized_project["contractAddress"],
                 "community_info": community_info['community_info']
             }
-            logger.info(f"Broadcasted Community info {normalized_project['name']}: {broadcast_info}")
+            # logger.info(f"Broadcasted Community info {normalized_project['name']}: {broadcast_info}")
+            logger.info(f"Broadcasted Community info {normalized_project['name']}")
             await broadcast_to_clients(broadcast_info)
 
     except Exception as e:
@@ -624,7 +625,7 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
             if user_info:
                 try:
                     twitter_info = json.loads(user_info)
-                    logger.info(f"Using celebrity info for {twitter_handle}")
+                    # logger.info(f"Using celebrity info for {twitter_handle}")
                 except json.JSONDecodeError:
                     twitter_info = None
         else:
@@ -677,6 +678,8 @@ async def add_meme_project(project: Dict[str, Any]):
         # Normalize project fields to match frontend expectations
         normalized_project = normalize_project(project)
         name = normalized_project["name"]
+        s = time.time()
+        # logger.info(f"name: {name}")
         
         # 更新统计数据
         update_project_stats(normalized_project)
@@ -713,7 +716,8 @@ async def add_meme_project(project: Dict[str, Any]):
 
         # 立即广播项目信息（不包含Twitter作者信息和Twitter社区信息）
         await broadcast_to_clients({"type": "new_project", "data": normalized_project})
-        logger.info(f"broadcast: {name}: {normalized_project['contractAddress']}")
+        # logger.info(f"broadcast: {name}: {normalized_project['contractAddress']} {time.time() - s}")
+        logger.info(f"broadcast: {name} {time.time() - s}")
         
         # 检查是否需要获取Twitter信息
         should_fetch_x_info = False
@@ -835,10 +839,11 @@ async def get_meme_projects(
             contract_address = project.get('contractAddress', '')
             if contract_address and contract_address.lower().endswith('pump'):
                 # 获取pump.fun描述
-                pump_desc = await fetch_pump_description(contract_address)
+                pump_info = await fetch_pump_description(contract_address)
                 
-                if pump_desc:
-                    project['pump_desc'] = pump_desc
+                if pump_info:
+                    project['pump_desc'] = pump_info['description']
+                    project['dev'] = pump_info['creator']
 
         return {
             "status": "success", 
@@ -1173,7 +1178,7 @@ if __name__ == "__main__":
         reload=False,
         log_level="info",
         access_log=False,  # 禁用HTTP请求访问日志
-        workers=24,  # 使用24个工作进程
+        workers=64,  # 使用24个工作进程
         limit_concurrency=1000,  # 限制并发连接数
         backlog=2048  # 增加等待队列大小
     )

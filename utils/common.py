@@ -5,6 +5,9 @@ import requests
 from bs4 import BeautifulSoup
 import uuid
 import warnings
+import asyncio
+import json
+import time
 
 # 禁用urllib3的InsecureRequestWarning警告
 from urllib3.exceptions import InsecureRequestWarning
@@ -85,47 +88,50 @@ async def fetch_pump_description(token_contract: str) -> str:
         
         # 发送请求，设置5秒超时
         response = requests.get(url, headers=headers, timeout=5, verify=False)
+        # response.raise_for_status()
         
-        # 检查响应状态
-        if response.status_code != 200:
-            return None
+        # 初始化结果
+        result = {'mint': token_contract}
+        html_str = response.text
         
-        # 解析HTML内容
-        html_content = response.text
-        soup = BeautifulSoup(html_content, 'html.parser')
+        coin_json_pattern = r'coin\\\":\s*({[^{]*\\\"mint\\\":\\\"' + re.escape(token_contract) + r'\\\"[^}]+})'
         
-        # 提取描述信息
-        description = None
-        
-        # 尝试从meta description获取
-        meta_description = soup.find('meta', attrs={'name': 'description'})
-        if meta_description:
-            description = meta_description.get('content')
-            return description
-        
-        # 尝试从og:description获取
-        og_description = soup.find('meta', attrs={'property': 'og:description'})
-        if og_description:
-            description = og_description.get('content')
-            return description
-        
-        # 如果没有找到描述，尝试从其他元素获取
-        desc_divs = soup.find_all('div', class_='text-lg')
-        for div in desc_divs:
-            text = div.get_text().strip()
-            if text:
-                return text
-        
-        # 尝试从段落获取
-        paragraphs = soup.find_all('p')
-        for p in paragraphs:
-            text = p.get_text().strip()
-            if text and len(text) > 30:
-                return text
-        
-        return None
-        
+        # for pattern in coin_json_patterns:
+        coin_match = re.search(coin_json_pattern, html_str)
+        if coin_match:
+            try:
+                coin_json_str = coin_match.group(1)
+                # 找到完整的JSON对象
+                open_braces = 1  # 已经找到了开始的 {
+                end_pos = len(coin_json_str)
+                
+                for i in range(1, len(coin_json_str)):
+                    if coin_json_str[i] == '{':
+                        open_braces += 1
+                    elif coin_json_str[i] == '}':
+                        open_braces -= 1
+                        if open_braces == 0:
+                            end_pos = i + 1
+                            break
+                
+                coin_json_str = coin_json_str[:end_pos]
+                coin_json_str = coin_json_str.replace('\\\"', '"').replace('\\\\', '\\')
+                
+                try:
+                    data = json.loads(coin_json_str)
+                    result = {k: data[k] for k in ['description', 'creator'] if k in data}
+                    return result
+                except json.JSONDecodeError:
+                    pass
+            except Exception:
+                pass
     except requests.exceptions.RequestException:
         return None
     except Exception:
         return None
+
+if __name__ == "__main__":
+    s = time.time()
+    d = fetch_pump_description("DUnxXSAEZg9uVGw7yuiYCtVSgb53JH3vHJgK9fr5pump")
+    print("all: ", time.time() - s)
+    print(d)
