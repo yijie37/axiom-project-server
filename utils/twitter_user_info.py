@@ -128,6 +128,17 @@ def get_twitter_community_info(community_id):
                 'creator_avtar': community_info['creator']['profile_image_url_https']
             }
             
+            # Add create_at field and convert to timestamp
+            if 'created_at' in community_info:
+                try:
+                    # Parse the time string format: "Thu Jun 19 02:09:48 +0000 2025"
+                    created_at_str = community_info['created_at']
+                    created_at_dt = datetime.strptime(created_at_str, "%a %b %d %H:%M:%S %z %Y")
+                    info['created_at'] = int(created_at_dt.timestamp())
+                except (ValueError, KeyError) as e:
+                    print(f"Error parsing created_at time: {e}")
+                    info['created_at'] = None
+
             return {
                 'status': 'success',
                 'community_info': info,

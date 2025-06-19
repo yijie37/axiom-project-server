@@ -593,6 +593,7 @@ async def fetch_and_broadcast_community_info(normalized_project: Dict[str, Any],
         # 如果缓存不存在或无效，则调用API获取
         if not community_info:
             community_info = get_twitter_community_info(community_id)
+            logger.info(f"community_info: {community_info['community_info']['comm_name']}, {community_info['community_info']['created_at']}")
             if community_info and community_info.get('status') == 'success':
                 # 缓存社区信息，设置16天过期时间
                 redis_client.setex(community_key, 3600 * 24 * 16, json.dumps(community_info))
