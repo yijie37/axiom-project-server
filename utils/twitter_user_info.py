@@ -116,20 +116,35 @@ def get_twitter_community_info(community_id):
             
             # Extract and format community and creator information
             info = {
-                'comm_name': community_info['name'],
-                'comm_desc': community_info['description'],
-                'comm_banner_url': community_info['banner_url'],
-                'member_count': community_info['member_count'],
-                'mod_count': community_info['moderator_count'],
-                'creator_name': community_info['creator']['name'],
-                'creator_description': community_info['creator']['description'],
-                'creator_followers_count': community_info['creator']['followers_count'],
-                'creator_statuses_count': community_info['creator']['statuses_count'],
-                'creator_avtar': community_info['creator']['profile_image_url_https']
+                'comm_name': community_info.get('name', ''),
+                'comm_desc': community_info.get('description', ''),
+                'comm_banner_url': community_info.get('banner_url', ''),
+                'member_count': community_info.get('member_count', 0),
+                'mod_count': community_info.get('moderator_count', 0),
             }
             
+            # Handle creator information safely
+            if 'creator' in community_info and community_info['creator']:
+                creator = community_info['creator']
+                info.update({
+                    'creator_name': creator.get('name', ''),
+                    'creator_description': creator.get('description', ''),
+                    'creator_followers_count': creator.get('followers_count', 0),
+                    'creator_statuses_count': creator.get('statuses_count', 0),
+                    'creator_avtar': creator.get('profile_image_url_https', '')
+                })
+            else:
+                # Set default values when creator information is not available
+                info.update({
+                    'creator_name': '',
+                    'creator_description': '',
+                    'creator_followers_count': 0,
+                    'creator_statuses_count': 0,
+                    'creator_avtar': ''
+                })
+            
             # Add create_at field and convert to timestamp
-            if 'created_at' in community_info:
+            if 'created_at' in community_info and community_info['created_at']:
                 try:
                     # Parse the time string format: "Thu Jun 19 02:09:48 +0000 2025"
                     created_at_str = community_info['created_at']

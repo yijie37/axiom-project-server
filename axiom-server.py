@@ -20,6 +20,7 @@ from utils.twitter_utils import get_twitter_user
 from utils.twitter_user_info import get_twitter_community_info
 from utils.common import extract_twitter_handle, extract_tweet_info, fetch_pump_description
 from contextlib import asynccontextmanager
+import traceback
 
 # 禁用urllib3的InsecureRequestWarning警告
 from urllib3.exceptions import InsecureRequestWarning
@@ -122,12 +123,24 @@ async def lifespan(app: FastAPI):
         FETCH_X_INFO = x_info_range
         logger.info(f"已从Redis加载X信息获取范围设置: {FETCH_X_INFO}")
     
+    # Start retry task
+    retry_task_handle = asyncio.create_task(retry_task())
+    logger.info("Started message retry task")
+    
     logger.info("Server startup complete")
     
     yield
     
     # Shutdown
     logger.info("Server shutting down")
+    
+    # Cancel retry task
+    retry_task_handle.cancel()
+    try:
+        await retry_task_handle
+    except asyncio.CancelledError:
+        logger.info("Retry task cancelled successfully")
+    
     # 设置停止事件
     stop_event.set()
     
@@ -158,9 +171,19 @@ app.add_middleware(
 # Store connected WebSocket clients
 connected_clients: List[WebSocket] = []
 
+# Store connected WebSocket clients with their message tracking
+client_message_tracking: Dict[WebSocket, Dict[str, Any]] = {}  # WebSocket -> tracking info
+
+# Global message ID counter
+message_id_counter = 0
+message_id_lock = asyncio.Lock()
+
+# Pending acknowledgments: message_id -> {client: timestamp}
+pending_acks: Dict[str, Dict[WebSocket, float]] = {}
+
 # Store recent projects, used for deduplication
 recent_projects: Dict[str, datetime] = {}  # tokenContract -> timestamp
-TIME_WINDOW = timedelta(minutes=5)  # 5 minutes time window
+TIME_WINDOW = timedelta(minutes=10)  # 10 minutes time window
 
 # Active projects tracking
 active_projects: Dict[str, Dict[str, Any]] = {}  # mint_address -> project_data
@@ -186,6 +209,146 @@ manually_removed_projects: Set[str] = set()  # 存储被手动删除的mint_addr
 # 全局变量: 控制是否获取X用户信息以及获取范围
 FETCH_X_INFO = "all"  # 可选值: "none", "launchacoin", "all"
 
+# Generate unique message ID
+async def generate_message_id() -> str:
+    """Generate a unique message ID"""
+    global message_id_counter
+    async with message_id_lock:
+        message_id_counter += 1
+        return f"msg_{int(time.time())}_{message_id_counter}"
+
+# Handle acknowledgment from client
+async def handle_acknowledgment(websocket: WebSocket, message_id: str):
+    """Handle acknowledgment from client"""
+    try:
+        if message_id in pending_acks and websocket in pending_acks[message_id]:
+            # 获取消息数据以检查是否是项目消息
+            message_data = redis_client.get(f"pending_message:{message_id}")
+            is_project_message = False
+            project_name = "Unknown"
+            token_name = "Unknown"
+            
+            if message_data:
+                try:
+                    original_message = json.loads(message_data)
+                    if original_message.get("type") == "new_project" and "data" in original_message:
+                        is_project_message = True
+                        project_name = original_message["data"].get("name", "Unknown")
+                        token_name = original_message["data"].get("symbol", "Unknown")
+                except:
+                    pass
+            
+            # Remove this client's pending ack
+            del pending_acks[message_id][websocket]
+            
+            # If no more pending acks for this message, clean up
+            if not pending_acks[message_id]:
+                del pending_acks[message_id]
+                # Clean up Redis
+                redis_client.delete(f"pending_message:{message_id}")
+                    
+    except Exception as e:
+        logger.error(f"Error handling acknowledgment: {e}")
+
+# Retry mechanism for unacknowledged messages
+async def retry_unacknowledged_messages():
+    """Retry sending unacknowledged messages"""
+    current_time = time.time()
+    retry_timeout = 5.0  # 5 seconds timeout
+    
+    messages_to_remove = []
+    retry_count = 0
+    
+    for message_id, client_timestamps in pending_acks.items():
+        clients_to_remove = []
+        
+        for client, timestamp in client_timestamps.items():
+            if current_time - timestamp > retry_timeout:
+                # Time to retry
+                if client in connected_clients:
+                    try:
+                        # Get the original message data from Redis or reconstruct
+                        message_data = redis_client.get(f"pending_message:{message_id}")
+                        if message_data:
+                            original_message = json.loads(message_data)
+                            
+                            # 检查是否是项目消息，如果是则打印详细信息
+                            if original_message.get("type") == "new_project" and "data" in original_message:
+                                project_data = original_message["data"]
+                                project_name = project_data.get("name", "Unknown")
+                                contract_address = project_data.get("contractAddress", "Unknown")
+                                token_name = project_data.get("symbol", "Unknown")
+                                time_since_sent = current_time - timestamp
+                                
+                                logger.warning(
+                                    f"项目消息未收到确认，准备重发: "
+                                    f"项目名='{project_name}', "
+                                    f"代币='{token_name}', "
+                                    f"合约地址='{contract_address}', "
+                                    f"消息ID='{message_id}', "
+                                    f"发送时间={time_since_sent:.1f}秒前, "
+                                    f"客户端连接数={len(connected_clients)}"
+                                )
+                            
+                            await client.send_json(original_message)
+                            # Update timestamp
+                            pending_acks[message_id][client] = current_time
+                            retry_count += 1
+                            
+                            # 如果是项目消息，打印重发成功日志
+                            if original_message.get("type") == "new_project" and "data" in original_message:
+                                project_data = original_message["data"]
+                                project_name = project_data.get("name", "Unknown")
+                                token_name = project_data.get("symbol", "Unknown")
+                                logger.info(f"项目消息重发成功: '{project_name}' (代币: {token_name}, 消息ID: {message_id})")
+                            else:
+                                logger.info(f"Retried message {message_id} to client")
+                                
+                        else:
+                            # Message data not found, remove from pending
+                            clients_to_remove.append(client)
+                            logger.warning(f"消息数据未找到，无法重发: {message_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to retry message {message_id}: {e}")
+                        clients_to_remove.append(client)
+                else:
+                    # Client disconnected, remove from pending
+                    clients_to_remove.append(client)
+                    logger.info(f"客户端已断开连接，移除待确认消息: {message_id}")
+        
+        # Remove clients that failed or disconnected
+        for client in clients_to_remove:
+            if client in pending_acks[message_id]:
+                del pending_acks[message_id][client]
+        
+        # If no more clients for this message, mark for removal
+        if not pending_acks[message_id]:
+            messages_to_remove.append(message_id)
+    
+    # Remove empty message entries
+    for message_id in messages_to_remove:
+        del pending_acks[message_id]
+        # Clean up Redis
+        redis_client.delete(f"pending_message:{message_id}")
+    
+    # 如果有重发操作，打印统计信息
+    if retry_count > 0:
+        logger.info(f"重发统计: 本次重发了 {retry_count} 条消息")
+
+# Background task for retry mechanism
+async def retry_task():
+    """Background task to handle message retries"""
+    while True:
+        try:
+            await retry_unacknowledged_messages()
+            await asyncio.sleep(2)  # Check every 2 seconds
+        except asyncio.CancelledError:
+            logger.info("Retry task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in retry task: {e}")
+            await asyncio.sleep(5)  # Wait longer on error
+
 # Broadcast to all connected clients
 async def broadcast_to_clients(data: Dict[str, Any]):
     # If it's a new project and the contract address ends with "pump", fetch description
@@ -199,6 +362,27 @@ async def broadcast_to_clients(data: Dict[str, Any]):
             if pump_desc:
                 project['pump_desc'] = pump_desc
     
+    # Generate message ID
+    message_id = await generate_message_id()
+    data_with_id = {**data, "messageId": message_id}
+    
+    # 如果是项目消息，打印详细信息
+    if data.get("type") == "new_project" and "data" in data:
+        project_data = data["data"]
+        project_name = project_data.get("name", "Unknown")
+        contract_address = project_data.get("contractAddress", "Unknown")
+        token_name = project_data.get("symbol", "Unknown")
+    
+    # Store message in Redis for potential retry
+    redis_client.setex(
+        f"pending_message:{message_id}",
+        60,  # 1 minute expiration
+        json.dumps(data_with_id)
+    )
+    
+    # Initialize pending acks for this message
+    pending_acks[message_id] = {}
+    
     # 记录广播状态
     # clients_count = len(connected_clients)
     # if clients_count > 0:
@@ -206,10 +390,14 @@ async def broadcast_to_clients(data: Dict[str, Any]):
     
     disconnected_clients = []
     broadcast_errors = 0
+    broadcast_success = 0
     
     for client in connected_clients:
         try:
-            await client.send_json(data)
+            await client.send_json(data_with_id)
+            # Add to pending acks
+            pending_acks[message_id][client] = time.time()
+            broadcast_success += 1
         except Exception as e:
             disconnected_clients.append(client)
             broadcast_errors += 1
@@ -220,10 +408,14 @@ async def broadcast_to_clients(data: Dict[str, Any]):
         for client in disconnected_clients:
             if client in connected_clients:
                 connected_clients.remove(client)
+            # Also remove from client_message_tracking
+            if client in client_message_tracking:
+                del client_message_tracking[client]
         logger.info(f"已移除 {len(disconnected_clients)} 个断开连接的客户端, 剩余 {len(connected_clients)} 个客户端")
     
     if broadcast_errors:
         logger.warning(f"广播过程中发生了 {broadcast_errors} 个错误")
+    
 
 # Fetch data stored by the monitoring process
 async def fetch_token_info_from_redis():
@@ -395,6 +587,11 @@ def handle_exit_signal(signum, frame):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     connected_clients.append(websocket)
+    client_message_tracking[websocket] = {
+        "connected_at": time.time(),
+        "last_activity": time.time(),
+        "message_count": 0
+    }
     logger.info(f"新的WebSocket连接建立，当前连接数: {len(connected_clients)}")
     
     try:
@@ -403,7 +600,19 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             try:
                 # Try to parse the data as JSON
-                project = json.loads(data)
+                message = json.loads(data)
+                
+                # Handle acknowledgment messages
+                if message.get("type") == "ack":
+                    message_id = message.get("messageId")
+                    if message_id:
+                        await handle_acknowledgment(websocket, message_id)
+                        # Update client activity
+                        client_message_tracking[websocket]["last_activity"] = time.time()
+                        continue
+                
+                # Handle regular project data
+                project = message
                 logger.info(f"收到项目数据: {project.get('name', 'Unknown')}")
                 
                 # 检查是否重复
@@ -418,6 +627,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 广播给所有客户端
                 await broadcast_to_clients({"type": "new_project", "data": normalized_project})
                 
+                # Update client activity
+                client_message_tracking[websocket]["last_activity"] = time.time()
+                client_message_tracking[websocket]["message_count"] += 1
+                
             except json.JSONDecodeError:
                 logger.error("JSON解析错误")
             except Exception as e:
@@ -428,6 +641,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in connected_clients:
             connected_clients.remove(websocket)
             logger.info(f"WebSocket连接断开，当前连接数: {len(connected_clients)}")
+        
+        # Clean up client tracking
+        if websocket in client_message_tracking:
+            del client_message_tracking[websocket]
 
 # 标准化项目字段函数
 def normalize_project(project: Dict[str, Any]) -> Dict[str, Any]:
@@ -611,7 +828,7 @@ async def fetch_and_broadcast_community_info(normalized_project: Dict[str, Any],
             await broadcast_to_clients(broadcast_info)
 
     except Exception as e:
-        logger.error(f"Error fetching Twitter info for {community_id}: {e}")
+        logger.error(f"Error fetching Community info for {community_id}: {traceback.format_exc()} \n {community_info}")
 
 # 添加一个新的异步函数来处理Twitter信息获取和广播
 async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], twitter_handle: str):
@@ -619,6 +836,7 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
     try:
         # 先检查是否是名人
         is_celebrity = twitter_redis.sismember("twitter:celebrities", twitter_handle.lower())
+        twitter_info = None
         
         if is_celebrity:
             # 如果是名人，直接从 Redis 获取用户信息
@@ -631,27 +849,28 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
                     twitter_info = None
         else:
             # 如果不是名人，检查缓存
-            expire_key = f"{twitter_handle}:expire"
-            
-            # 检查缓存是否存在
-            if twitter_redis.exists(expire_key):
-                # 缓存存在，直接从 Redis 获取用户信息
-                user_info = twitter_redis.get(twitter_handle)
-                if user_info:
-                    try:
-                        twitter_info = json.loads(user_info)
-                        logger.info(f"Using cached Twitter info for {twitter_handle}")
-                    except json.JSONDecodeError:
-                        twitter_info = None
-            else:
-                # 缓存不存在，调用 API 获取信息
-                twitter_info = get_twitter_user(twitter_handle)
-                if twitter_info:
-                    # 增加Twitter API调用计数
-                    redis_client.incr(STATS_TWITTER_API_CALLS)
-                    # 设置缓存过期时间
-                    twitter_redis.setex(expire_key, 7200, "1")
-                    logger.info(f"Set new cache for {twitter_handle}")
+            if twitter_handle != "i" and twitter_handle != "search" and twitter_handle != "intent":
+                expire_key = f"{twitter_handle}:expire"
+                
+                # 检查缓存是否存在
+                if twitter_redis.exists(expire_key):
+                    # 缓存存在，直接从 Redis 获取用户信息
+                    user_info = twitter_redis.get(twitter_handle)
+                    if user_info:
+                        try:
+                            twitter_info = json.loads(user_info)
+                            logger.info(f"Using cached Twitter info for {twitter_handle}")
+                        except json.JSONDecodeError:
+                            twitter_info = None
+                else:
+                    # 缓存不存在，调用 API 获取信息
+                    twitter_info = get_twitter_user(twitter_handle)
+                    if twitter_info:
+                        # 增加Twitter API调用计数
+                        redis_client.incr(STATS_TWITTER_API_CALLS)
+                        # 设置缓存过期时间
+                        twitter_redis.setex(expire_key, 7200, "1")
+                        logger.info(f"Set new cache for {twitter_handle}")
         
         # 如果获取到Twitter信息，更新项目并广播
         if twitter_info:
@@ -670,7 +889,9 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
             await broadcast_to_clients(broadcast_info)
             
     except Exception as e:
-        logger.error(f"Error fetching Twitter info for {twitter_handle}: {e}")
+        # print error stack
+        logger.error(f"Error fetching Twitter info for {twitter_handle}: {traceback.format_exc()}")
+        # logger.error(f"Error fetching Twitter info for {twitter_handle}: {e}")
 
 # 修改 add_meme_project 函数中的相关部分
 @app.post("/api/meme-projects")

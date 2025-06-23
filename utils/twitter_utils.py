@@ -72,7 +72,8 @@ def get_twitter_user(username: str):
         if user_info is None or not user_info.get('id', None):
             user_info_from_api = get_twitter_user_info(username)
             if not user_info_from_api or user_info_from_api.get('status') != 'success':
-                raise ValueError(f"Failed to get basic info for {username}")
+                error_msg = f"Failed to get basic info for {username}"
+                raise ValueError(error_msg)
             
             user_id = user_info_from_api['data']['id']
             # user_followingCount = user_info_from_api['data']['following']
