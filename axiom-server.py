@@ -18,7 +18,7 @@ import traceback
 # from pumpfun_comments import get_token_info
 from utils.twitter_utils import get_twitter_user
 from utils.twitter_user_info import get_twitter_community_info
-from utils.common import extract_twitter_handle, extract_tweet_info, fetch_pump_description
+from utils.common import extract_twitter_handle, extract_tweet_info, fetch_pump_description, fetch_bonk_description
 from contextlib import asynccontextmanager
 import traceback
 
@@ -178,8 +178,8 @@ client_message_tracking: Dict[WebSocket, Dict[str, Any]] = {}  # WebSocket -> tr
 message_id_counter = 0
 message_id_lock = asyncio.Lock()
 
-# Pending acknowledgments: message_id -> {client: timestamp}
-pending_acks: Dict[str, Dict[WebSocket, float]] = {}
+# Pending acknowledgments: message_id -> {client: (timestamp, retry_count)}
+pending_acks: Dict[str, Dict[WebSocket, tuple[float, int]]] = {}
 
 # Store recent projects, used for deduplication
 recent_projects: Dict[str, datetime] = {}  # tokenContract -> timestamp
@@ -238,6 +238,9 @@ async def handle_acknowledgment(websocket: WebSocket, message_id: str):
                 except:
                     pass
             
+            # Get retry count for logging
+            timestamp, retry_count = pending_acks[message_id][websocket]
+            
             # Remove this client's pending ack
             del pending_acks[message_id][websocket]
             
@@ -246,6 +249,12 @@ async def handle_acknowledgment(websocket: WebSocket, message_id: str):
                 del pending_acks[message_id]
                 # Clean up Redis
                 redis_client.delete(f"pending_message:{message_id}")
+                
+            # Log acknowledgment with retry info
+            if is_project_message:
+                logger.info(f"收到项目消息确认: '{project_name}' (代币: {token_name}, 消息ID: {message_id}, 重发次数: {retry_count})")
+            else:
+                logger.info(f"收到消息确认: {message_id} (重发次数: {retry_count})")
                     
     except Exception as e:
         logger.error(f"Error handling acknowledgment: {e}")
@@ -262,8 +271,15 @@ async def retry_unacknowledged_messages():
     for message_id, client_timestamps in pending_acks.items():
         clients_to_remove = []
         
-        for client, timestamp in client_timestamps.items():
+        for client, (timestamp, retry_count) in client_timestamps.items():
             if current_time - timestamp > retry_timeout:
+                # Check if we've already retried too many times
+                if retry_count >= 2:
+                    # Max retries reached, remove from pending
+                    clients_to_remove.append(client)
+                    logger.warning(f"消息 {message_id} 已达到最大重发次数(2次)，停止重发")
+                    continue
+                
                 # Time to retry
                 if client in connected_clients:
                     try:
@@ -281,7 +297,7 @@ async def retry_unacknowledged_messages():
                                 time_since_sent = current_time - timestamp
                                 
                                 logger.warning(
-                                    f"项目消息未收到确认，准备重发: "
+                                    f"项目消息未收到确认，准备重发(第{retry_count + 1}次): "
                                     f"项目名='{project_name}', "
                                     f"代币='{token_name}', "
                                     f"合约地址='{contract_address}', "
@@ -291,8 +307,8 @@ async def retry_unacknowledged_messages():
                                 )
                             
                             await client.send_json(original_message)
-                            # Update timestamp
-                            pending_acks[message_id][client] = current_time
+                            # Update timestamp and retry count
+                            pending_acks[message_id][client] = (current_time, retry_count + 1)
                             retry_count += 1
                             
                             # 如果是项目消息，打印重发成功日志
@@ -300,9 +316,9 @@ async def retry_unacknowledged_messages():
                                 project_data = original_message["data"]
                                 project_name = project_data.get("name", "Unknown")
                                 token_name = project_data.get("symbol", "Unknown")
-                                logger.info(f"项目消息重发成功: '{project_name}' (代币: {token_name}, 消息ID: {message_id})")
+                                logger.info(f"项目消息重发成功(第{retry_count}次): '{project_name}' (代币: {token_name}, 消息ID: {message_id})")
                             else:
-                                logger.info(f"Retried message {message_id} to client")
+                                logger.info(f"Retried message {message_id} to client (attempt {retry_count})")
                                 
                         else:
                             # Message data not found, remove from pending
@@ -334,6 +350,16 @@ async def retry_unacknowledged_messages():
     # 如果有重发操作，打印统计信息
     if retry_count > 0:
         logger.info(f"重发统计: 本次重发了 {retry_count} 条消息")
+        
+        # 统计达到最大重发次数的消息
+        max_retry_reached = 0
+        for message_id, client_timestamps in pending_acks.items():
+            for client, (timestamp, retry_count) in client_timestamps.items():
+                if retry_count >= 2:
+                    max_retry_reached += 1
+        
+        if max_retry_reached > 0:
+            logger.warning(f"有 {max_retry_reached} 条消息已达到最大重发次数(2次)")
 
 # Background task for retry mechanism
 async def retry_task():
@@ -351,17 +377,6 @@ async def retry_task():
 
 # Broadcast to all connected clients
 async def broadcast_to_clients(data: Dict[str, Any]):
-    # If it's a new project and the contract address ends with "pump", fetch description
-    if data.get("type") == "new_project" and "data" in data:
-        project = data["data"]
-        contract_address = project.get('contractAddress', '')
-        if contract_address and contract_address.lower().endswith('pump'):
-            # 获取pump.fun描述
-            pump_desc = await fetch_pump_description(contract_address)
-            
-            if pump_desc:
-                project['pump_desc'] = pump_desc
-    
     # Generate message ID
     message_id = await generate_message_id()
     data_with_id = {**data, "messageId": message_id}
@@ -396,7 +411,7 @@ async def broadcast_to_clients(data: Dict[str, Any]):
         try:
             await client.send_json(data_with_id)
             # Add to pending acks
-            pending_acks[message_id][client] = time.time()
+            pending_acks[message_id][client] = (time.time(), 0)
             broadcast_success += 1
         except Exception as e:
             disconnected_clients.append(client)
@@ -646,6 +661,36 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in client_message_tracking:
             del client_message_tracking[websocket]
 
+# 判断part字段的函数
+def determine_part_value(project: Dict[str, Any]) -> int:
+    """
+    判断part字段的值
+    如果project的name转小写后，是contractAddress的后缀或前缀（pump，bonk，boop后缀除外），则part为1，否则为0
+    """
+    project_name = project.get('name', '').lower()
+    contract_address = project.get('contractAddress', '').lower()
+    
+    if not project_name or not contract_address:
+        return 0
+    
+    # 排除的后缀
+    excluded_suffixes = ['pump', 'bonk', 'boop']
+    
+    # 检查是否是后缀（排除特定后缀）
+    for suffix in excluded_suffixes:
+        if contract_address.endswith(suffix):
+            return 0
+    
+    # 检查name是否是contractAddress的后缀
+    if contract_address.endswith(project_name):
+        return 1
+    
+    # 检查name是否是contractAddress的前缀
+    if contract_address.startswith(project_name):
+        return 1
+    
+    return 0
+
 # 标准化项目字段函数
 def normalize_project(project: Dict[str, Any]) -> Dict[str, Any]:
     # Make a copy to avoid modifying the original
@@ -759,6 +804,9 @@ def normalize_project(project: Dict[str, Any]) -> Dict[str, Any]:
     if "timestamp" not in normalized:
         normalized["timestamp"] = int(time.time() * 1000)  # Milliseconds
     
+    # 添加part字段
+    normalized["part"] = determine_part_value(normalized)
+    
     return normalized
 
 # 是否是重复项目检查函数
@@ -869,7 +917,7 @@ async def fetch_and_broadcast_twitter_info(normalized_project: Dict[str, Any], t
                         # 增加Twitter API调用计数
                         redis_client.incr(STATS_TWITTER_API_CALLS)
                         # 设置缓存过期时间
-                        twitter_redis.setex(expire_key, 7200, "1")
+                        twitter_redis.setex(expire_key, 3600 * 24 * 10, "1")
                         logger.info(f"Set new cache for {twitter_handle}")
         
         # 如果获取到Twitter信息，更新项目并广播
@@ -931,10 +979,54 @@ async def add_meme_project(project: Dict[str, Any]):
         # 判断是否有社交媒体
         has_social_media = has_hover_tweet or (has_links and not has_pump_only) or has_social_media
         
-        # 如果无社交媒体，不广播并增加不广播计数
-        if not has_social_media and not normalized_project["website"]:
-            redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
-            return {"status": "ignored", "message": "Project ignored due to no social media"}
+        # # 如果无社交媒体且part为0，不广播并增加不广播计数
+        # if not has_social_media and not normalized_project["website"] and normalized_project["part"] == 0:
+        #     redis_client.incr(STATS_NOT_BROADCAST_PROJECTS)
+        #     return {"status": "ignored", "message": "Project ignored due to no social media and part=0"}
+
+        # 获取dev字段和dev_history
+        contract_address = normalized_project.get('contractAddress', '')
+        
+        # 处理pump.fun项目
+        if contract_address and contract_address.lower().endswith('pump'):
+            # 获取pump.fun描述
+            pump_info = await fetch_pump_description(contract_address)
+            
+            if pump_info:
+                normalized_project['pump_desc'] = pump_info.get('description', '')
+                normalized_project['dev'] = pump_info.get('creator', '')
+        
+        # 处理bonk.fun项目
+        elif contract_address and contract_address.lower().endswith('bonk'):
+            # 获取bonk.fun描述
+            bonk_info = await fetch_bonk_description(contract_address)
+            
+            if bonk_info:
+                normalized_project['pump_desc'] = bonk_info.get('description', '')
+                normalized_project['dev'] = bonk_info.get('creator', '')
+        
+        # 添加dev_history字段
+        if normalized_project.get('dev'):
+            # 从Redis DB 6读取creator_tokens信息
+            creator_tokens_key = f"creator_tokens:{normalized_project['dev']}"
+            creator_tokens_data = redis_client.get(creator_tokens_key)
+            
+            if creator_tokens_data:
+                try:
+                    creator_tokens = json.loads(creator_tokens_data)
+                    if isinstance(creator_tokens, list) and len(creator_tokens) > 0:
+                        # 提取所有symbol字段
+                        dev_history = [token.get('symbol', '') for token in creator_tokens if token.get('symbol')]
+                        normalized_project['dev_history'] = dev_history
+                    else:
+                        normalized_project['dev_history'] = []
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"解析creator_tokens数据失败: {e}")
+                    normalized_project['dev_history'] = []
+            else:
+                normalized_project['dev_history'] = []
+        else:
+            normalized_project['dev_history'] = []
 
         # 立即广播项目信息（不包含Twitter作者信息和Twitter社区信息）
         await broadcast_to_clients({"type": "new_project", "data": normalized_project})
@@ -1059,13 +1151,24 @@ async def get_meme_projects(
         # 处理每个项目
         for project in projects:
             contract_address = project.get('contractAddress', '')
+            
+            # 处理pump.fun项目
             if contract_address and contract_address.lower().endswith('pump'):
                 # 获取pump.fun描述
                 pump_info = await fetch_pump_description(contract_address)
                 
                 if pump_info:
-                    project['pump_desc'] = pump_info['description']
-                    project['dev'] = pump_info['creator']
+                    project['pump_desc'] = pump_info.get('description', '')
+                    project['dev'] = pump_info.get('creator', '')
+            
+            # 处理bonk.fun项目
+            elif contract_address and contract_address.lower().endswith('bonk'):
+                # 获取bonk.fun描述
+                bonk_info = await fetch_bonk_description(contract_address)
+                
+                if bonk_info:
+                    project['bonk_desc'] = bonk_info.get('description', '')
+                    project['dev'] = bonk_info.get('creator', '')
 
         return {
             "status": "success", 
@@ -1388,6 +1491,233 @@ async def add_test_data():
         logger.error(f"Failed to add test data: {str(e)}")
         logger.error(f"Error details: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to add test data: {str(e)}")
+
+# 新增API接口：记录创建者代币信息
+@app.post("/api/record_creator")
+# async def record_creator(creator_address: str, symbol: str, token_address: str):
+async def record_creator(creator_info: Dict[str, str]):
+    """记录创建者代币信息
+    
+    Args:
+        creator_address: 创建者地址
+        symbol: 代币符号
+        token_address: 代币地址
+        
+    Returns:
+        dict: 操作结果
+    """
+    try:
+        # 验证参数
+        if not creator_info or not creator_info.get("creator_address") or not creator_info.get("symbol") or not creator_info.get("token_address"):
+            raise HTTPException(status_code=400, detail="所有参数都是必需的")
+
+        creator_address = creator_info.get("creator_address")
+        symbol = creator_info.get("symbol")
+        token_address = creator_info.get("token_address")
+        
+        # 创建者代币信息
+        creator_token_info = {
+            "symbol": symbol,
+            "token_address": token_address
+        }
+        
+        key = f"creator_tokens:{creator_address}"
+        
+        # 检查key是否存在
+        if redis_client.exists(key):
+            # 获取现有数据
+            existing_data = redis_client.get(key)
+            if existing_data:
+                try:
+                    creator_tokens = json.loads(existing_data)
+                    if not isinstance(creator_tokens, list):
+                        creator_tokens = []
+                except json.JSONDecodeError:
+                    creator_tokens = []
+            else:
+                creator_tokens = []
+            
+            # 检查token_address是否已存在
+            existing_token_addresses = [token.get("token_address") for token in creator_tokens]
+            if token_address in existing_token_addresses:
+                return {
+                    "status": "skipped",
+                    "message": f"代币 {token_address} 已存在于创建者 {creator_address} 的记录中",
+                    "creator_address": creator_address,
+                    "symbol": symbol,
+                    "token_address": token_address
+                }
+            
+            # 添加新代币
+            creator_tokens.append(creator_token_info)
+            redis_client.set(key, json.dumps(creator_tokens))
+            logger.info(f"更新创建者代币: {creator_address} -> {symbol} ({token_address})")
+            
+            return {
+                "status": "updated",    
+                "message": f"成功更新创建者 {creator_address} 的代币记录",
+                "creator_address": creator_address,
+                "symbol": symbol,
+                "token_address": token_address,
+                "total_tokens": len(creator_tokens)
+            }
+        else:
+            # 创建新的创建者记录
+            creator_tokens = [creator_token_info]
+            redis_client.set(key, json.dumps(creator_tokens))
+            logger.info(f"创建创建者代币: {creator_address} -> {symbol} ({token_address})")
+            
+            return {
+                "status": "created",
+                "message": f"成功创建创建者 {creator_address} 的代币记录",
+                "creator_address": creator_address,
+                "symbol": symbol,
+                "token_address": token_address,
+                "total_tokens": 1
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"记录创建者代币信息失败: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
+# 新增API接口：获取创建者的代币列表
+@app.get("/api/get_tokens_by_creator")
+async def get_tokens_by_creator(creator_address: str):
+    """获取创建者部署的代币列表
+    
+    Args:
+        creator_address: 创建者地址
+        
+    Returns:
+        dict: 包含代币列表的响应
+    """
+    try:
+        # 验证参数
+        if not creator_address:
+            raise HTTPException(status_code=400, detail="创建者地址是必需的")
+        
+        key = f"creator_tokens:{creator_address}"
+        
+        # 检查key是否存在
+        if not redis_client.exists(key):
+            return {
+                "status": "not_found",
+                "message": f"未找到创建者 {creator_address} 的代币记录",
+                "creator_address": creator_address,
+                "tokens": []
+            }
+        
+        # 获取创建者代币数据
+        creator_data = redis_client.get(key)
+        if not creator_data:
+            return {
+                "status": "empty",
+                "message": f"创建者 {creator_address} 的代币记录为空",
+                "creator_address": creator_address,
+                "tokens": []
+            }
+        
+        try:
+            creator_tokens = json.loads(creator_data)
+            if not isinstance(creator_tokens, list):
+                creator_tokens = []
+        except json.JSONDecodeError:
+            logger.error(f"解析创建者 {creator_address} 的代币数据失败")
+            return {
+                "status": "error",
+                "message": "数据解析失败",
+                "creator_address": creator_address,
+                "tokens": []
+            }
+        
+        # 格式化返回数据
+        tokens_list = []
+        for token in creator_tokens:
+            tokens_list.append({
+                "symbol": token.get("symbol", "Unknown"),
+                "token_address": token.get("token_address", "Unknown")
+            })
+        
+        logger.info(f"获取创建者 {creator_address} 的代币列表: {len(tokens_list)} 个代币")
+        
+        return {
+            "status": "success",
+            "message": f"成功获取创建者 {creator_address} 的代币列表",
+            "creator_address": creator_address,
+            "tokens": tokens_list,
+            "total_count": len(tokens_list)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取创建者代币列表失败: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
+# 新增API接口：检查代币是否为顶级代币
+@app.get("/api/check_top_token")
+async def check_top_token(token_address: str):
+    """检查代币是否为顶级市值代币
+    
+    Args:
+        token_address: 代币地址
+        
+    Returns:
+        dict: 代币信息
+    """
+    try:
+        # 验证参数
+        if not token_address:
+            raise HTTPException(status_code=400, detail="代币地址是必需的")
+        
+        key = f"top_token:{token_address}"
+        
+        # 检查key是否存在
+        if not redis_client.exists(key):
+            return {
+                "status": "not_found",
+                "message": f"代币 {token_address} 不是顶级市值代币",
+                "token_address": token_address,
+                "token_info": None
+            }
+        
+        # 获取代币信息
+        token_data = redis_client.get(key)
+        if not token_data:
+            return {
+                "status": "empty",
+                "message": f"代币 {token_address} 的信息为空",
+                "token_address": token_address,
+                "token_info": None
+            }
+        
+        try:
+            token_info = json.loads(token_data)
+        except json.JSONDecodeError:
+            logger.error(f"解析代币 {token_address} 的数据失败")
+            return {
+                "status": "error",
+                "message": "数据解析失败",
+                "token_address": token_address,
+                "token_info": None
+            }
+        
+        logger.info(f"检查顶级代币: {token_address} -> {token_info.get('name', 'Unknown')}")
+        
+        return {
+            "status": "found",
+            "message": f"代币 {token_address} 是顶级市值代币",
+            "token_address": token_address,
+            "token_info": token_info
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"检查顶级代币失败: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

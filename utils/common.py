@@ -130,8 +130,83 @@ async def fetch_pump_description(token_contract: str) -> str:
     except Exception:
         return None
 
+# Function to fetch bonk.fun description and creator
+async def fetch_bonk_description(token_contract: str) -> Optional[Dict[str, str]]:
+    """Fetch description and creator from bonk.fun for a given token contract."""
+    # 生成请求跟踪ID
+    request_id = str(uuid.uuid4())[:8]
+    
+    # 验证合约地址
+    if not is_valid_contract_address(token_contract):
+        logger.warning(f"[{request_id}] 无效的合约地址: {token_contract}")
+        return None
+        
+    try:
+        # 构建URL
+        url = f"https://launch-mint-v1.raydium.io/get/by/mints?ids={token_contract}"
+        
+        # 使用requests库发送请求
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        
+        logger.info(f"[{request_id}] 正在获取bonk.fun信息: {token_contract}")
+        
+        # 发送请求，设置10秒超时
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 检查响应结构
+            if data.get("success") and "data" in data and "rows" in data["data"]:
+                rows = data["data"]["rows"]
+                if len(rows) > 0:
+                    token_info = rows[0]
+                    
+                    # 提取description和creator
+                    description = token_info.get("description", "")
+                    creator = token_info.get("creator", "")
+                    
+                    if creator:
+                        logger.info(f"[{request_id}] 成功获取bonk.fun信息: creator={creator}, description长度={len(description)}")
+                        return {
+                            "description": description,
+                            "creator": creator
+                        }
+                    else:
+                        logger.warning(f"[{request_id}] Token信息中未找到creator字段")
+                else:
+                    logger.warning(f"[{request_id}] 未找到token信息")
+            else:
+                logger.warning(f"[{request_id}] API响应格式异常: {data}")
+        else:
+            logger.error(f"[{request_id}] API请求失败，状态码: {response.status_code}")
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"[{request_id}] 请求超时: {token_contract}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[{request_id}] 请求异常: {e}")
+    except Exception as e:
+        logger.error(f"[{request_id}] 未知异常: {e}")
+    
+    return None
+
 if __name__ == "__main__":
+    # 测试pump.fun功能
     s = time.time()
     d = fetch_pump_description("DUnxXSAEZg9uVGw7yuiYCtVSgb53JH3vHJgK9fr5pump")
-    print("all: ", time.time() - s)
+    print("pump.fun测试: ", time.time() - s)
     print(d)
+    
+    # 测试bonk.fun功能
+    import asyncio
+    async def test_bonk():
+        s = time.time()
+        d = await fetch_bonk_description("AtortPA9SVbkKmdzu5zg4jxgkR4howvPshorA9jYbonk")
+        print("bonk.fun测试: ", time.time() - s)
+        print(d)
+    
+    asyncio.run(test_bonk())

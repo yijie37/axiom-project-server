@@ -3,6 +3,7 @@ import redis
 import json
 import traceback
 import os
+import datetime
 from utils.twitter_user_info import get_twitter_user_info
 from utils.wasm_caller import PumpPillAPI
 from utils.pumppill import send_pump_pill_request
@@ -57,14 +58,18 @@ def get_user_info_from_redis(username: str) -> str:
 def get_twitter_user(username: str):
     """
     获取Twitter用户的完整信息，包括基本信息和pump信息
-    
-    Args:
-        username (str): Twitter用户名
-        
-    Returns:
-        dict: 包含用户完整信息的字典
+    限制每天成功调用次数不超过800次。
     """
     try:
+        # ==== 新增：每天调用次数限制 ====
+        today = datetime.datetime.utcnow().strftime('%Y%m%d')
+        count_key = f"twitter_user_success_{today}"
+        current_count = twitter_redis.get(count_key)
+        if current_count is not None and int(current_count) >= 800:
+            print(f"[限制] 今日get_twitter_user成功调用次数已达上限800，拒绝调用 {username}")
+            return None
+        # ==== 结束 ====
+
         # 1. 首先尝试从Redis获取user_id
         user_info = get_user_info_from_redis(username)
         
@@ -74,14 +79,9 @@ def get_twitter_user(username: str):
             if not user_info_from_api or user_info_from_api.get('status') != 'success':
                 error_msg = f"Failed to get basic info for {username}"
                 raise ValueError(error_msg)
-            
             user_id = user_info_from_api['data']['id']
-            # user_followingCount = user_info_from_api['data']['following']
-            # user_followerCount = user_info_from_api['data']['followers']
         else:
             user_id = user_info['id']
-            # user_followingCount = user_info['followingCount']
-            # user_followerCount = user_info['followerCount']
         
         # 3. 获取签名 - 使用全局 PumpPillAPI 实例
         sign = pump_pill_api.encrypt_data(username, user_id)
@@ -92,12 +92,12 @@ def get_twitter_user(username: str):
             raise ValueError(f"Failed to get pump info for {username}")
         
         # 5. 合并信息
-        # flatten basic_info and pump_info
-        # pump_info['data']['id'] = user_id
-        # pump_info['data']['followingCount'] = user_followingCount
-        # pump_info['data']['followerCount'] = user_followerCount
-
         data = get_user_info_from_redis(username)
+        
+        # ==== 新增：成功后自增计数 ====
+        twitter_redis.incr(count_key)
+        twitter_redis.expire(count_key, 60*60*48)  # 2天过期，防止key堆积
+        # ==== 结束 ====
         
         return data
         
